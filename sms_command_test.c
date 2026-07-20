@@ -39,13 +39,13 @@ int main(void) {
     };
     enum sms_command_type type;
 
-    assert(sms_command_process(&config, "+8613800138000", "_zbxReg wxid_alice", &type) == SMS_COMMAND_OK);
+    assert(sms_command_process(&config, "+8613800138000", "_smsReg wxid_alice", &type) == SMS_COMMAND_OK);
     assert(type == SMS_COMMAND_REGISTRATION && state.lookup_calls == 1 && state.contact_inserts == 1);
-    assert(sms_command_process(&config, "+8613800138000", "_zbxRoute east-hub", &type) == SMS_COMMAND_OK);
+    assert(sms_command_process(&config, "+8613800138000", "_smsRoute east-hub", &type) == SMS_COMMAND_OK);
     assert(type == SMS_COMMAND_ROUTE && state.route_inserts == 1);
-    assert(sms_command_process(&config, "+8613900138000", "_zbxRoute east-hub", NULL) == SMS_COMMAND_UNAUTHORIZED_SENDER);
+    assert(sms_command_process(&config, "+8613900138000", "_smsRoute east-hub", NULL) == SMS_COMMAND_UNAUTHORIZED_SENDER);
     assert(sms_command_process(&config, "+8613800138000", "hello", NULL) == SMS_COMMAND_NOT_A_COMMAND);
-    assert(sms_command_process(&config, "+8613800138000", "_zbxReg", NULL) == SMS_COMMAND_INVALID_PAYLOAD);
+    assert(sms_command_process(&config, "+8613800138000", "_smsReg", NULL) == SMS_COMMAND_INVALID_PAYLOAD);
 
     puts("SMS command processing tests passed.");
     return 0;

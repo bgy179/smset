@@ -44,12 +44,12 @@ int sms_command_process(const struct sms_command_config *config,
     }
     COMMAND_LOG("Authorized SMS received from %s; checking command prefix\n", sender_phone);
 
-    result = command_payload(message, "_zbxReg", payload);
+    result = command_payload(message, "_smsReg", payload);
     if (result == SMS_COMMAND_OK) {
         struct sms_wechat_contact contact;
         if (config->lookup_wechat_contact == NULL || config->insert_contact == NULL)
             return SMS_COMMAND_INVALID_INPUT;
-        COMMAND_LOG("Processing _zbxReg with lookup key length %zu\n", strlen(payload));
+        COMMAND_LOG("Processing _smsReg with lookup key length %zu\n", strlen(payload));
         memset(&contact, 0, sizeof(contact));
         if (config->lookup_wechat_contact(config->context, payload, &contact) != 0) {
             COMMAND_LOG("WeChat contact lookup failed\n");
@@ -60,21 +60,21 @@ int sms_command_process(const struct sms_command_config *config,
             return SMS_COMMAND_DATABASE_FAILED;
         }
         if (processed_type != NULL) *processed_type = SMS_COMMAND_REGISTRATION;
-        COMMAND_LOG("_zbxReg completed successfully\n");
+        COMMAND_LOG("_smsReg completed successfully\n");
         return SMS_COMMAND_OK;
     }
     if (result == SMS_COMMAND_INVALID_PAYLOAD) return result;
 
-    result = command_payload(message, "_zbxRoute", payload);
+    result = command_payload(message, "_smsRoute", payload);
     if (result == SMS_COMMAND_OK) {
         if (config->insert_route == NULL) return SMS_COMMAND_INVALID_INPUT;
-        COMMAND_LOG("Processing _zbxRoute with payload length %zu\n", strlen(payload));
+        COMMAND_LOG("Processing _smsRoute with payload length %zu\n", strlen(payload));
         if (config->insert_route(config->context, payload, sender_phone) != 0) {
             COMMAND_LOG("MySQL route insert failed\n");
             return SMS_COMMAND_DATABASE_FAILED;
         }
         if (processed_type != NULL) *processed_type = SMS_COMMAND_ROUTE;
-        COMMAND_LOG("_zbxRoute completed successfully\n");
+        COMMAND_LOG("_smsRoute completed successfully\n");
         return SMS_COMMAND_OK;
     }
     if (result == SMS_COMMAND_INVALID_PAYLOAD) return result;

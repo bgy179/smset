@@ -28,7 +28,7 @@ struct sms_wechat_contact {
 
 /*
  * Implement this adapter with the appropriate WeChat API for the deployment.
- * `lookup_key` is the text following `_zbxReg`; return 0 for success.
+ * `lookup_key` is the text following `_smsReg`; return 0 for success.
  */
 typedef int (*sms_wechat_lookup_fn)(void *context, const char *lookup_key,
                                     struct sms_wechat_contact *contact);
@@ -54,8 +54,8 @@ struct sms_command_config {
 
 /*
  * Checks that sender_phone exactly matches `authorized_phone`, recognizes an
- * SMS beginning with `_zbxReg` or `_zbxRoute`, and dispatches it. `_zbxReg`
- * queries WeChat then stores the returned contact; `_zbxRoute` stores its
+ * SMS beginning with `_smsReg` or `_smsRoute`, and dispatches it. `_smsReg`
+ * queries WeChat then stores the returned contact; `_smsRoute` stores its
  * payload directly. Noncommands and unauthorized messages have nonnegative
  * return values and perform no external operation.
  */
