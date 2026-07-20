@@ -22,8 +22,7 @@ enum sms_command_type {
 /* Normalized contact information obtained from the configured WeChat API. */
 struct sms_wechat_contact {
     char wechat_id[128];
-    char display_name[256];
-    char phone_number[64];
+    char nick_name[256];
 };
 
 /*

@@ -1,5 +1,5 @@
 #include "sms_command.h"
-
+#include "jsmn.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -25,7 +25,7 @@ int wechat_lookup_contact_http(const struct wechat_lookup_config *config,
 
     timeout_ms = (config->timeout_ms > 0u) ? config->timeout_ms : 2000u;
     snprintf(request_body, sizeof(request_body),
-             "{\"dbName\":\"%s\",\"sql\":\"select * from Contact where UserName='%s'\"}",
+             "{\"dbName\":\"%s\",\"sql\":\"select NickName, UserName from Contact where NickName='%s'\"}",
              config->db_name, lookup_key);
 
     snprintf(command, sizeof(command),
@@ -45,16 +45,40 @@ int wechat_lookup_contact_http(const struct wechat_lookup_config *config,
     if (pclose(pipe) != 0) return -1;
 
     memset(contact, 0, sizeof(*contact));
-    if (json_extract_string(response, "UserName", contact->wechat_id, sizeof(contact->wechat_id)) != 0) {
+
+    jsmn_parser p;
+    jsmn_init(&p);
+    jsmntok_t tokens[128];
+    int r = jsmn_parse(&p, response, strlen(response), tokens, sizeof(tokens) / sizeof(tokens[0]));
+
+    if (r < 0) {
         return -1;
     }
-    if (json_extract_string(response, "NickName", contact->display_name, sizeof(contact->display_name)) != 0) {
+    if (r < 1 || tokens[0].type != JSMN_OBJECT) {
         return -1;
     }
-    if (json_extract_string(response, "Phone", contact->phone_number, sizeof(contact->phone_number)) != 0) {
-        return -1;
+
+    for (int i = 1; i < r; i++) {
+        jsmntok_t *key = &tokens[i];
+        if (key->type != JSMN_STRING) continue;
+        if (i + 1 >= r) break;
+        jsmntok_t *value = &tokens[i + 1];
+
+        if (jsoneq(response, key, "UserName") == 0) {
+            int len = value->end - value->start;
+            if (len >= sizeof(contact->wechat_id)) return -1;
+            memcpy(contact->wechat_id, response + value->start, len);
+            contact->wechat_id[len] = '\0';
+        } else if (jsoneq(response, key, "NickName") == 0) {
+            int len = value->end - value->start;
+            if (len >= sizeof(contact->nick_name)) return -1;
+            memcpy(contact->nick_name, response + value->start, len);
+            contact->nick_name[len] = '\0';
+        } 
+        i++;
     }
-    if (contact->wechat_id[0] == '\0' || contact->display_name[0] == '\0') {
+
+    if (contact->wechat_id[0] == '\0' || contact->nick_name[0] == '\0') {
         return -1;
     }
     return 0;
@@ -105,6 +129,7 @@ int sms_command_process(const struct sms_command_config *config,
             COMMAND_LOG("WeChat contact lookup failed\n");
             return SMS_COMMAND_WECHAT_FAILED;
         }
+        
         if (config->insert_contact(config->context, &contact, payload, sender_phone) != 0) {
             COMMAND_LOG("MySQL contact insert failed\n");
             return SMS_COMMAND_DATABASE_FAILED;
