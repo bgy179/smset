@@ -73,12 +73,12 @@ int wechat_lookup_contact_http(const struct wechat_lookup_config *config,
         jsmntok_t *value = &tokens[i + 1];
 
         if (jsoneq(response, key, "UserName") == 0) {
-            int len = value->end - value->start;
+            size_t len = value->end - value->start;
             if (len >= sizeof(contact->wechat_id)) return -1;
             memcpy(contact->wechat_id, response + value->start, len);
             contact->wechat_id[len] = '\0';
         } else if (jsoneq(response, key, "NickName") == 0) {
-            int len = value->end - value->start;
+            size_t len = value->end - value->start;
             if (len >= sizeof(contact->nick_name)) return -1;
             memcpy(contact->nick_name, response + value->start, len);
             contact->nick_name[len] = '\0';
