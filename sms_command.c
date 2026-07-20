@@ -99,11 +99,14 @@ int insert_chatroom(void *context, const struct sms_wechat_contact *contact,
                     const char *tenantname)
 {
     char sql[1024] = {0};
+    (void)context;
+    (void)sender_phone;
+
     snprintf(sql, sizeof(sql), "INSERT INTO wzwmonitor.wechat_chatroom(wxid, nickname, tenantname) "
                 "VALUES('%s', '%s', '%s');", contact->wechat_id, contact->nick_name, tenantname);
 
-    mysql_query(g_mysql_connection, sql);
-    
+    mysql_query(mysql_conn, sql);
+
     return 0;
 }
 
@@ -153,7 +156,7 @@ int sms_command_process(const struct sms_command_config *config,
             return SMS_COMMAND_WECHAT_FAILED;
         }
         
-        if (config->insert_contact(config->context, &contact, payload, sender_phone) != 0) {
+        if (config->insert_contact(config->context, &contact, payload) != 0) {
             COMMAND_LOG("MySQL contact insert failed\n");
             return SMS_COMMAND_DATABASE_FAILED;
         }
