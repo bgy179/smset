@@ -3,6 +3,14 @@
 #include <stdio.h>
 #include <string.h>
 
+static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
+    if (tok->type == JSMN_STRING && (int)strlen(s) == tok->end - tok->start &&
+        strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
 /* Define SMS_COMMAND_ENABLE_DEBUG_LOG to log command classification and dispatch. */
 #ifdef SMS_COMMAND_ENABLE_DEBUG_LOG
 #define COMMAND_LOG(...) fprintf(stderr, "[smset-command] " __VA_ARGS__)
@@ -74,7 +82,7 @@ int wechat_lookup_contact_http(const struct wechat_lookup_config *config,
             if (len >= sizeof(contact->nick_name)) return -1;
             memcpy(contact->nick_name, response + value->start, len);
             contact->nick_name[len] = '\0';
-        } 
+        }
         i++;
     }
 

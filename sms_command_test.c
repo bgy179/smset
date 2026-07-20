@@ -11,15 +11,14 @@ static int test_lookup(void *context, const char *key, struct sms_wechat_contact
     assert(strcmp(key, "wxid_alice") == 0);
     ++state->lookup_calls;
     strcpy(contact->wechat_id, "wxid_alice");
-    strcpy(contact->display_name, "Alice");
-    strcpy(contact->phone_number, "+15551234567");
+    strcpy(contact->nick_name, "Alice");
     return 0;
 }
 
 static int test_insert_contact(void *context, const struct sms_wechat_contact *contact,
                                const char *key, const char *sender) {
     struct test_state *state = context;
-    assert(strcmp(contact->display_name, "Alice") == 0);
+    assert(strcmp(contact->nick_name, "Alice") == 0);
     assert(strcmp(key, "wxid_alice") == 0 && strcmp(sender, "+8613800138000") == 0);
     ++state->contact_inserts;
     return 0;
