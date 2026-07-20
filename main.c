@@ -32,6 +32,11 @@ typedef struct {
     int service_mode;
 } SmsConfig;
 
+#if !defined(_WIN32)
+/* State used only by the local serial-port simulator. */
+static int g_simulated_sms_state = 0;
+#endif
+
 #if defined(_WIN32)
 static volatile BOOL g_running = TRUE;
 static SERVICE_STATUS_HANDLE g_status_handle = 0;
@@ -146,24 +151,45 @@ static HANDLE open_port(const SmsConfig *cfg) {
 
 static int write_serial(HANDLE hPort, const char *data) {
 #if defined(_WIN32)
-    DWORD written = 0;
-    return WriteFile(hPort, data, (DWORD)strlen(data), &written, NULL) && written > 0;
+    size_t length = strlen(data);
+    size_t offset = 0;
+
+    while (offset < length) {
+        DWORD written = 0;
+        DWORD remaining = (DWORD)(length - offset);
+        if (!WriteFile(hPort, data + offset, remaining, &written, NULL) || written == 0) {
+            return 0;
+        }
+        offset += written;
+    }
+    return 1;
 #else
     (void)hPort;
     log_message("TX: %s", data);
+    if (strncmp(data, "AT+CMGS=", 8) == 0) {
+        g_simulated_sms_state = 1;
+    } else if (g_simulated_sms_state == 2 && strchr(data, '\x1A') != NULL) {
+        g_simulated_sms_state = 3;
+    }
     return 1;
 #endif
 }
 
 static int read_serial(HANDLE hPort, char *buffer, size_t buffer_size, DWORD timeout_ms) {
 #if defined(_WIN32)
+    if (buffer == NULL || buffer_size == 0) {
+        return 0;
+    }
+
     DWORD start = GetTickCount();
     size_t index = 0;
     DWORD read = 0;
+    buffer[0] = '\0';
 
     while ((GetTickCount() - start) < timeout_ms) {
         if (ReadFile(hPort, buffer + index, 1, &read, NULL) && read == 1) {
             index++;
+            buffer[index] = '\0';
             if (index >= buffer_size - 1) {
                 break;
             }
@@ -186,8 +212,12 @@ static int read_serial(HANDLE hPort, char *buffer, size_t buffer_size, DWORD tim
     (void)hPort;
     (void)timeout_ms;
     if (buffer != NULL && buffer_size > 0) {
-        if (strstr(buffer, ">") != NULL) {
-            snprintf(buffer, buffer_size, ">" );
+        if (g_simulated_sms_state == 1) {
+            snprintf(buffer, buffer_size, ">");
+            g_simulated_sms_state = 2;
+        } else if (g_simulated_sms_state == 3) {
+            snprintf(buffer, buffer_size, "+CMGS: 1\r\nOK");
+            g_simulated_sms_state = 0;
         } else {
             snprintf(buffer, buffer_size, "OK");
         }
@@ -217,6 +247,11 @@ static int send_command(HANDLE hPort, const char *command, char *response, size_
 
     log_response("Modem reply", local_response);
 
+    if (strstr(local_response, "ERROR") != NULL) {
+        log_message("Modem rejected command: %s", command != NULL ? command : "<empty>");
+        return 0;
+    }
+
     if (response != NULL && response_size > 0) {
         strncpy(response, local_response, response_size - 1);
         response[response_size - 1] = '\0';
@@ -229,15 +264,15 @@ static int init_modem(HANDLE hPort) {
     char response[MAX_RESPONSE];
     log_message("Initializing modem with AT commands");
 
-    if (!send_command(hPort, "AT\r", response, sizeof(response))) {
+    if (!send_command(hPort, "AT\r", response, sizeof(response)) || strstr(response, "OK") == NULL) {
         return 0;
     }
 
-    if (!send_command(hPort, "AT+CMGF=1\r", response, sizeof(response))) {
+    if (!send_command(hPort, "AT+CMGF=1\r", response, sizeof(response)) || strstr(response, "OK") == NULL) {
         return 0;
     }
 
-    if (!send_command(hPort, "AT+CNMI=2,1,0,0,0\r", response, sizeof(response))) {
+    if (!send_command(hPort, "AT+CNMI=2,1,0,0,0\r", response, sizeof(response)) || strstr(response, "OK") == NULL) {
         return 0;
     }
 
@@ -249,10 +284,20 @@ static int send_sms(HANDLE hPort, const char *phone, const char *message, char *
     char cmd[256];
     char payload[MAX_RESPONSE];
 
-    log_message("Preparing SMS send to %s", phone);
-    log_message("SMS payload length: %zu", strlen(message));
+    if (phone == NULL || message == NULL || response == NULL || response_size == 0 ||
+        strpbrk(phone, "\r\n\"") != NULL || strchr(message, '\x1A') != NULL) {
+        log_message("Invalid SMS phone number, message, or response buffer.");
+        return 0;
+    }
 
-    snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"\r", phone);
+    size_t message_length = strlen(message);
+    log_message("Preparing SMS send to %s", phone);
+    log_message("SMS payload length: %zu", message_length);
+
+    if (snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"\r", phone) >= (int)sizeof(cmd)) {
+        log_message("Phone number is too long.");
+        return 0;
+    }
     if (!send_command(hPort, cmd, response, response_size)) {
         return 0;
     }
@@ -262,7 +307,13 @@ static int send_sms(HANDLE hPort, const char *phone, const char *message, char *
         return 0;
     }
 
-    snprintf(payload, sizeof(payload), "%s\x1A", message);
+    if (message_length > sizeof(payload) - 2) {
+        log_message("SMS message is too long.");
+        return 0;
+    }
+    memcpy(payload, message, message_length);
+    payload[message_length] = '\x1A';
+    payload[message_length + 1] = '\0';
     log_message("Transmitting SMS payload");
     if (!write_serial(hPort, payload)) {
         return 0;
@@ -274,7 +325,21 @@ static int send_sms(HANDLE hPort, const char *phone, const char *message, char *
     }
 
     log_response("SMS send confirmation", response);
+    if (strstr(response, "ERROR") != NULL || strstr(response, "+CMGS:") == NULL || strstr(response, "OK") == NULL) {
+        log_message("Modem did not confirm SMS delivery to its message queue.");
+        return 0;
+    }
     return 1;
+}
+
+static void close_port(HANDLE hPort) {
+#if defined(_WIN32)
+    if (hPort != INVALID_HANDLE_VALUE) {
+        CloseHandle(hPort);
+    }
+#else
+    (void)hPort;
+#endif
 }
 
 static int receive_sms(HANDLE hPort, char *response, size_t response_size) {
@@ -294,6 +359,7 @@ static int run_sms_loop(const SmsConfig *cfg) {
 
     if (!init_modem(hPort)) {
         log_message("Modem initialization failed.");
+        close_port(hPort);
         return 1;
     }
 
@@ -313,16 +379,7 @@ static int run_sms_loop(const SmsConfig *cfg) {
     }
 
     log_message("Stopping SMS monitoring loop.");
-    return 0;
-}
-#endif
-
-#if defined(_WIN32)
-
-        Sleep(5000);
-    }
-
-    log_message("Stopping SMS monitoring loop.");
+    close_port(hPort);
     return 0;
 }
 #endif
@@ -410,6 +467,7 @@ static int run_self_test(void) {
 
     if (!init_modem(hPort)) {
         log_message("Self-test failed: modem initialization failed");
+        close_port(hPort);
         return 1;
     }
 
@@ -417,15 +475,18 @@ static int run_self_test(void) {
     memset(response, 0, sizeof(response));
     if (!send_sms(hPort, "+15551234567", "Self-test SMS", response, sizeof(response))) {
         log_message("Self-test failed: SMS send step failed");
+        close_port(hPort);
         return 1;
     }
 
     if (!receive_sms(hPort, response, sizeof(response))) {
         log_message("Self-test failed: SMS receive step failed");
+        close_port(hPort);
         return 1;
     }
 
     log_message("Self-test completed successfully");
+    close_port(hPort);
     return 0;
 }
 
@@ -453,6 +514,7 @@ int main(int argc, char **argv) {
         }
 
         if (!init_modem(hPort)) {
+            close_port(hPort);
             return 1;
         }
 
@@ -465,6 +527,7 @@ int main(int argc, char **argv) {
             log_message("SMS send failed.");
         }
 
+        close_port(hPort);
         return ok ? 0 : 1;
     }
 
@@ -475,16 +538,19 @@ int main(int argc, char **argv) {
         }
 
         if (!init_modem(hPort)) {
+            close_port(hPort);
             return 1;
         }
 
         char response[MAX_RESPONSE];
         memset(response, 0, sizeof(response));
-        if (receive_sms(hPort, response, sizeof(response))) {
+        int ok = receive_sms(hPort, response, sizeof(response));
+        if (ok) {
             printf("%s\n", response);
         }
 
-        return 0;
+        close_port(hPort);
+        return ok ? 0 : 1;
     }
 
     printf("Usage:\n");
