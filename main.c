@@ -78,7 +78,9 @@ static void normalize_port_name(const char *port, char *buffer, size_t buffer_si
 
 static HANDLE open_port(const SmsConfig *cfg) {
     char full_port[64];
+    log_message("Port setup: requested port=%s, baud=%lu", cfg->port, cfg->baud);
     normalize_port_name(cfg->port, full_port, sizeof(full_port));
+    log_message("Port setup: normalized port name=%s", full_port);
 
 #if defined(_WIN32)
     log_message("Opening serial port %s", full_port);
@@ -125,6 +127,7 @@ static HANDLE open_port(const SmsConfig *cfg) {
         CloseHandle(hPort);
         return INVALID_HANDLE_VALUE;
     }
+    log_message("Port setup: applied 8N1 serial settings with hardware and software flow control disabled");
 
     COMMTIMEOUTS timeouts;
     memset(&timeouts, 0, sizeof(timeouts));
@@ -139,6 +142,8 @@ static HANDLE open_port(const SmsConfig *cfg) {
         CloseHandle(hPort);
         return INVALID_HANDLE_VALUE;
     }
+    log_message("Port setup: read timeout=%lu ms, write timeout=%lu ms",
+                timeouts.ReadTotalTimeoutConstant, timeouts.WriteTotalTimeoutConstant);
 
     PurgeComm(hPort, PURGE_RXCLEAR | PURGE_TXCLEAR);
     log_message("Port configuration complete for %s at %lu baud", full_port, cfg->baud);
@@ -154,17 +159,22 @@ static int write_serial(HANDLE hPort, const char *data) {
     size_t length = strlen(data);
     size_t offset = 0;
 
+    log_message("Serial write: submitting %zu byte(s)", length);
+
     while (offset < length) {
         DWORD written = 0;
         DWORD remaining = (DWORD)(length - offset);
         if (!WriteFile(hPort, data + offset, remaining, &written, NULL) || written == 0) {
+            log_message("Serial write: failed after %zu of %zu byte(s). Error=%lu", offset, length, GetLastError());
             return 0;
         }
         offset += written;
     }
+    log_message("Serial write: completed %zu byte(s)", length);
     return 1;
 #else
     (void)hPort;
+    log_message("Serial write: submitting %zu byte(s)", strlen(data));
     log_message("TX: %s", data);
     if (strncmp(data, "AT+CMGS=", 8) == 0) {
         g_simulated_sms_state = 1;
@@ -203,10 +213,12 @@ static int read_serial(HANDLE hPort, char *buffer, size_t buffer_size, DWORD tim
 
     if (index > 0) {
         buffer[index] = '\0';
+        log_message("Serial read: received %zu byte(s) in %lu ms", index, GetTickCount() - start);
         return 1;
     }
 
     buffer[0] = '\0';
+    log_message("Serial read: no data received within %lu ms", timeout_ms);
     return 0;
 #else
     (void)hPort;
@@ -231,7 +243,8 @@ static int send_command(HANDLE hPort, const char *command, char *response, size_
     char local_response[MAX_RESPONSE];
     memset(local_response, 0, sizeof(local_response));
 
-    log_message("Sending AT command: %s", command != NULL ? command : "<empty>");
+    log_message("Command step: command=%s, response capacity=%zu byte(s)",
+                command != NULL ? command : "<empty>", response_size);
 
     if (command != NULL && command[0] != '\0') {
         if (!write_serial(hPort, command)) {
@@ -246,6 +259,7 @@ static int send_command(HANDLE hPort, const char *command, char *response, size_
     }
 
     log_response("Modem reply", local_response);
+    log_message("Command step: response length=%zu byte(s)", strlen(local_response));
 
     if (strstr(local_response, "ERROR") != NULL) {
         log_message("Modem rejected command: %s", command != NULL ? command : "<empty>");
@@ -262,16 +276,19 @@ static int send_command(HANDLE hPort, const char *command, char *response, size_
 
 static int init_modem(HANDLE hPort) {
     char response[MAX_RESPONSE];
-    log_message("Initializing modem with AT commands");
+    log_message("Initialization: starting modem connectivity and SMS text-mode setup");
 
+    log_message("Initialization step 1/3: checking modem connectivity");
     if (!send_command(hPort, "AT\r", response, sizeof(response)) || strstr(response, "OK") == NULL) {
         return 0;
     }
 
+    log_message("Initialization step 2/3: enabling SMS text mode");
     if (!send_command(hPort, "AT+CMGF=1\r", response, sizeof(response)) || strstr(response, "OK") == NULL) {
         return 0;
     }
 
+    log_message("Initialization step 3/3: enabling incoming-SMS notifications");
     if (!send_command(hPort, "AT+CNMI=2,1,0,0,0\r", response, sizeof(response)) || strstr(response, "OK") == NULL) {
         return 0;
     }
@@ -298,6 +315,7 @@ static int send_sms(HANDLE hPort, const char *phone, const char *message, char *
         log_message("Phone number is too long.");
         return 0;
     }
+    log_message("SMS step 1/3: requesting message-entry prompt");
     if (!send_command(hPort, cmd, response, response_size)) {
         return 0;
     }
@@ -306,6 +324,7 @@ static int send_sms(HANDLE hPort, const char *phone, const char *message, char *
         log_message("Modem did not return the SMS prompt. Response: %s", response);
         return 0;
     }
+    log_message("SMS step 2/3: modem prompt received; constructing %zu-byte payload plus terminator", message_length);
 
     if (message_length > sizeof(payload) - 2) {
         log_message("SMS message is too long.");
@@ -329,6 +348,7 @@ static int send_sms(HANDLE hPort, const char *phone, const char *message, char *
         log_message("Modem did not confirm SMS delivery to its message queue.");
         return 0;
     }
+    log_message("SMS step 3/3: modem accepted message and assigned it to its outgoing queue");
     return 1;
 }
 
@@ -343,7 +363,7 @@ static void close_port(HANDLE hPort) {
 }
 
 static int receive_sms(HANDLE hPort, char *response, size_t response_size) {
-    log_message("Polling modem for incoming SMS messages");
+    log_message("Receive step: polling modem message storage for all SMS records");
     if (!send_command(hPort, "AT+CMGL=\"ALL\"\r", response, response_size)) {
         return 0;
     }
