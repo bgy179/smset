@@ -10,6 +10,60 @@
 #define COMMAND_LOG(...) ((void)0)
 #endif
 
+int wechat_lookup_contact_http(const struct wechat_lookup_config *config,
+                               const char *lookup_key,
+                               struct sms_wechat_contact *contact) {
+    char request_body[1024];
+    char response[4096];
+    char command[2048];
+    FILE *pipe;
+    const char *api_url;
+    const char *db_name;
+    int timeout_ms;
+
+    if (config == NULL || lookup_key == NULL || contact == NULL) return -1;
+    if (config->api_url == NULL || config->db_name == NULL) return -1;
+
+    api_url = config->api_url;
+    db_name = config->db_name;
+    timeout_ms = (config->timeout_ms > 0) ? (int)config->timeout_ms : 2000;
+
+    snprintf(request_body, sizeof(request_body),
+             "{\"dbName\":\"%s\",\"sql\":\"select * from Contact where UserName='%s'\"}",
+             db_name, lookup_key);
+
+    snprintf(command, sizeof(command),
+             "curl -sS --max-time %d -X POST -H 'Content-Type: application/json' "
+             "--data '%s' '%s'",
+             timeout_ms, request_body, api_url);
+
+    pipe = popen(command, "r");
+    if (pipe == NULL) return -1;
+
+    memset(response, 0, sizeof(response));
+    if (fread(response, 1, sizeof(response) - 1, pipe) == 0) {
+        pclose(pipe);
+        return -1;
+    }
+
+    if (pclose(pipe) != 0) return -1;
+
+    memset(contact, 0, sizeof(*contact));
+    if (json_extract_string(response, "UserName", contact->wechat_id, sizeof(contact->wechat_id)) != 0) {
+        return -1;
+    }
+    if (json_extract_string(response, "NickName", contact->display_name, sizeof(contact->display_name)) != 0) {
+        return -1;
+    }
+    if (json_extract_string(response, "Phone", contact->phone_number, sizeof(contact->phone_number)) != 0) {
+        return -1;
+    }
+    if (contact->wechat_id[0] == '\0' || contact->display_name[0] == '\0') {
+        return -1;
+    }
+    return 0;
+}
+
 /* Returns the nonempty, whitespace-trimmed payload after a recognized prefix. */
 static int command_payload(const char *message, const char *prefix,
                            char payload[SMS_COMMAND_PAYLOAD_MAX]) {
