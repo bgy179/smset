@@ -61,7 +61,7 @@ struct wechat_lookup_config {
 int wechat_lookup_contact_http(const struct wechat_lookup_config *config,
                                const char *lookup_key,
                                struct sms_wechat_contact *contact);
-                               
+
 /*
  * Checks that sender_phone exactly matches `authorized_phone`, recognizes an
  * SMS beginning with `_smsReg` or `_smsRoute`, and dispatches it. `_smsReg`

@@ -10,6 +10,7 @@
 #define COMMAND_LOG(...) ((void)0)
 #endif
 
+
 int wechat_lookup_contact_http(const struct wechat_lookup_config *config,
                                const char *lookup_key,
                                struct sms_wechat_contact *contact) {
@@ -17,25 +18,20 @@ int wechat_lookup_contact_http(const struct wechat_lookup_config *config,
     char response[4096];
     char command[2048];
     FILE *pipe;
-    const char *api_url;
-    const char *db_name;
-    int timeout_ms;
+    unsigned int timeout_ms;
 
     if (config == NULL || lookup_key == NULL || contact == NULL) return -1;
     if (config->api_url == NULL || config->db_name == NULL) return -1;
 
-    api_url = config->api_url;
-    db_name = config->db_name;
-    timeout_ms = (config->timeout_ms > 0) ? (int)config->timeout_ms : 2000;
-
+    timeout_ms = (config->timeout_ms > 0u) ? config->timeout_ms : 2000u;
     snprintf(request_body, sizeof(request_body),
              "{\"dbName\":\"%s\",\"sql\":\"select * from Contact where UserName='%s'\"}",
-             db_name, lookup_key);
+             config->db_name, lookup_key);
 
     snprintf(command, sizeof(command),
-             "curl -sS --max-time %d -X POST -H 'Content-Type: application/json' "
+             "curl -sS --max-time %u -X POST -H 'Content-Type: application/json' "
              "--data '%s' '%s'",
-             timeout_ms, request_body, api_url);
+             timeout_ms, request_body, config->api_url);
 
     pipe = popen(command, "r");
     if (pipe == NULL) return -1;
