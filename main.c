@@ -421,6 +421,7 @@ static DWORD WINAPI service_worker_thread(LPVOID param) {
     return 0;
 }
 
+
 static void WINAPI service_ctrl_handler(DWORD control) {
     if (control == SERVICE_CONTROL_STOP) {
         g_running = FALSE;
