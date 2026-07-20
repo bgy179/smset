@@ -100,7 +100,6 @@ int insert_chatroom(void *context, const struct sms_wechat_contact *contact,
 {
     char sql[1024] = {0};
     (void)context;
-    (void)sender_phone;
 
     snprintf(sql, sizeof(sql), "INSERT INTO wzwmonitor.wechat_chatroom(wxid, nickname, tenantname) "
                 "VALUES('%s', '%s', '%s');", contact->wechat_id, contact->nick_name, tenantname);
