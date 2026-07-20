@@ -1,7 +1,10 @@
 #include "sms_command.h"
 #include "jsmn.h"
+#include <mysql/mysql.h>
 #include <stdio.h>
 #include <string.h>
+
+MYSQL *mysql_conn;
 
 static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
     if (tok->type == JSMN_STRING && (int)strlen(s) == tok->end - tok->start &&
@@ -89,6 +92,18 @@ int wechat_lookup_contact_http(const struct wechat_lookup_config *config,
     if (contact->wechat_id[0] == '\0' || contact->nick_name[0] == '\0') {
         return -1;
     }
+    return 0;
+}
+
+int insert_chatroom(void *context, const struct sms_wechat_contact *contact,
+                    const char *tenantname)
+{
+    char sql[1024] = {0};
+    snprintf(sql, sizeof(sql), "INSERT INTO wzwmonitor.wechat_chatroom(wxid, nickname, tenantname) "
+                "VALUES('%s', '%s', '%s');", contact->wechat_id, contact->nick_name, tenantname);
+
+    mysql_query(g_mysql_connection, sql);
+    
     return 0;
 }
 

@@ -37,8 +37,7 @@ typedef int (*sms_wechat_lookup_fn)(void *context, const char *lookup_key,
  */
 typedef int (*sms_mysql_insert_contact_fn)(void *context,
                                            const struct sms_wechat_contact *contact,
-                                           const char *lookup_key,
-                                           const char *sender_phone);
+                                           const char *tenantname);
 typedef int (*sms_mysql_insert_route_fn)(void *context, const char *route_data,
                                          const char *sender_phone);
 
