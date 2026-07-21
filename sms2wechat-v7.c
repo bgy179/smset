@@ -1158,6 +1158,16 @@ static void flush_incomplete_pending_sms(PendingSMS *node) {
 }
 
 void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
+    WriteLog("[帧跟踪] raw_id=%d sender=%s concat=%d ref=%d part=%d/%d dcs=0x%02X payload=%zu",
+             raw_table_id,
+             frame->sender,
+             frame->is_concat ? 1 : 0,
+             frame->ref_num,
+             frame->part_num,
+             frame->total_parts,
+             frame->dcs,
+             frame->data_len);
+
     if (!frame->is_concat) {
         char utf8_buf[4096];
         WriteLog("[单片短信] 判定为单体标准短消息，直接切入解码分发...");
@@ -1196,6 +1206,15 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
         if(pending_queue_head) pending_queue_head->prev = target;
         pending_queue_head = target;
     }
+
+    if (target) {
+        WriteLog("[长短信合并] 命中缓冲槽 Ref=%d sender=%s 当前已到达=%d/%d 首片已等待=%lld秒",
+                 target->ref_num,
+                 target->sender,
+                 target->arrived_count,
+                 target->total_parts,
+                 (long long)(time(NULL) - target->first_seen));
+    }
     
     for(SMSPartNode *p = target->parts_head; p; p = p->next) { 
         if(p->part_num == frame->part_num) {
@@ -1220,6 +1239,30 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
     }
     target->arrived_count++;
     WriteLog("[长短信合并] 分片切片挂载成功 (%d/%d)。", target->arrived_count, target->total_parts);
+
+    if (target->arrived_count < target->total_parts) {
+        char missing_parts[256] = {0};
+        size_t used = 0;
+        for (uint8_t i = 1; i <= target->total_parts; i++) {
+            bool found = false;
+            for (SMSPartNode *p = target->parts_head; p; p = p->next) {
+                if (p->part_num == i) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                int w = snprintf(missing_parts + used,
+                                 sizeof(missing_parts) - used,
+                                 used == 0 ? "%u" : ",%u",
+                                 i);
+                if (w <= 0 || (size_t)w >= sizeof(missing_parts) - used) break;
+                used += (size_t)w;
+            }
+        }
+        WriteLog("[长短信合并] Ref=%d 仍在等待分片: [%s]", target->ref_num,
+                 missing_parts[0] ? missing_parts : "unknown");
+    }
     
     char sql[128]; 
     snprintf(sql, sizeof(sql), "UPDATE raw_sms SET status=1 WHERE id=%d", raw_table_id); 
@@ -1273,11 +1316,17 @@ void ParsePduSmsResponse(char* atResp) {
     static size_t streamLen = 0;
     static int currentMsgIndex = -1;
     static bool isLiveCmtReport = false;
+    static DWORD lastPartialLogTick = 0;
 
     if (!atResp || atResp[0] == '\0') return;
 
     size_t inLen = strlen(atResp);
     if (inLen == 0) return;
+
+    if (strstr(atResp, "+CMT:") || strstr(atResp, "+CMGL:") || strstr(atResp, "ERROR")) {
+        WriteLog("[解析入口] 收到关键串口片段 %zu字节 idx=%d cmt=%d",
+                 inLen, currentMsgIndex, isLiveCmtReport ? 1 : 0);
+    }
 
     if (inLen >= sizeof(streamBuf)) {
         atResp += (inLen - (sizeof(streamBuf) - 1));
@@ -1301,6 +1350,7 @@ void ParsePduSmsResponse(char* atResp) {
     streamBuf[streamLen] = '\0';
 
     size_t cursor = 0;
+    size_t parsedLineCount = 0;
     while (cursor < streamLen) {
         char *eol = strstr(streamBuf + cursor, "\r\n");
         if (!eol) break;
@@ -1353,46 +1403,41 @@ void ParsePduSmsResponse(char* atResp) {
                     if (!SerialWriteAll(hSerial, delCmd, (DWORD)strlen(delCmd))) {
                         WriteLog("[芯片清理] 删除短信指令下发失败，串口写入异常");
                     } else {
-                        char tmp[BUF_LEN];
-                        if (SerialCollectUntilQuiet(hSerial, tmp, sizeof(tmp), 600, 120)) {
-                            /*
-                             * Do not recurse into ParsePduSmsResponse here: it uses static parser state.
-                             * Re-entrant calls can corrupt cursor/state and drop later segments.
-                             * Instead, append drained bytes to current stream and continue this loop.
-                             */
-                            size_t addLen = strlen(tmp);
-                            if (addLen > 0) {
-                                if (addLen >= sizeof(streamBuf)) {
-                                    tmp[sizeof(streamBuf) - 1] = '\0';
-                                    addLen = sizeof(streamBuf) - 1;
-                                }
-
-                                if (streamLen + addLen >= sizeof(streamBuf)) {
-                                    size_t drop2 = (streamLen + addLen) - (sizeof(streamBuf) - 1);
-                                    if (drop2 >= streamLen) {
-                                        streamLen = 0;
-                                    } else {
-                                        memmove(streamBuf, streamBuf + drop2, streamLen - drop2);
-                                        streamLen -= drop2;
-                                    }
-                                    streamBuf[streamLen] = '\0';
-                                    WriteLog("[串口缓冲] 删除应答阶段追加数据触发缓冲挤压，丢弃最旧 %zu 字节", drop2);
-                                }
-
-                                memcpy(streamBuf + streamLen, tmp, addLen);
-                                streamLen += addLen;
-                                streamBuf[streamLen] = '\0';
-                            }
-                        }
+                        /*
+                         * Do not synchronously read delete ACK here.
+                         * Let the main receive loop collect all bytes uniformly,
+                         * otherwise CMGD ACK/URC interleaving can stall or starve new SMS parsing.
+                         */
                     }
                 }
 
                 currentMsgIndex = -1;
                 isLiveCmtReport = false;
+                WriteLog("[解析状态] 当前PDU处理闭环结束，状态复位 idx=%d cmt=%d", currentMsgIndex, isLiveCmtReport ? 1 : 0);
+            } else if (strlen(line) > 0 && strstr(line, "OK") == NULL && strstr(line, "+CIEV:") == NULL) {
+                WriteLog("[解析旁路] 行未进入PDU流程 idx=%d cmt=%d line=%s",
+                         currentMsgIndex,
+                         isLiveCmtReport ? 1 : 0,
+                         line);
             }
         }
 
+        parsedLineCount++;
+
         cursor = (size_t)(eol - streamBuf) + 2;
+    }
+
+    if (parsedLineCount > 0) {
+        WriteLog("[解析统计] 本轮解析完成 行数=%zu 剩余缓冲=%zu idx=%d cmt=%d",
+                 parsedLineCount, streamLen - cursor, currentMsgIndex, isLiveCmtReport ? 1 : 0);
+    }
+
+    if (cursor == 0 && streamLen > 0) {
+        DWORD nowTick = GetTickCount();
+        if (nowTick - lastPartialLogTick >= 5000) {
+            WriteLog("[解析等待] 缓冲中存在未闭合行，等待更多字节拼接。当前缓冲=%zu 字节", streamLen);
+            lastPartialLogTick = nowTick;
+        }
     }
 
     if (cursor > 0) {
@@ -1426,7 +1471,6 @@ void ServiceWorkLoop() {
     }
     WriteLog("[服务核心] 通信总线已打通。准备对Air780配置高频主动上报机制参数...");
     
-    DWORD recv;
     char buf[32] = {0};
     
     if (!SerialWriteAll(hSerial, "AT+CMGF=0\r\n", 11)) {
@@ -1459,6 +1503,8 @@ void ServiceWorkLoop() {
 
     while (1) {
         char resp[AT_BUF] = {0};
+        static DWORD lastRxTick = 0;
+        static DWORD lastIdleLogTick = 0;
         
         if (!g_bDebugMode) {
             if (WaitForSingleObject(g_hStopEvent, 100) == WAIT_OBJECT_0) break; 
@@ -1467,7 +1513,20 @@ void ServiceWorkLoop() {
         }
 
         if (SerialCollectUntilQuiet(hSerial, resp, sizeof(resp), 300, 50)) {
+            size_t rxLen = strlen(resp);
+            lastRxTick = GetTickCount();
+            WriteLog("[接收主循环] 本轮串口收包 %zu字节 CMT=%d CMGL=%d OK=%d",
+                     rxLen,
+                     strstr(resp, "+CMT:") ? 1 : 0,
+                     strstr(resp, "+CMGL:") ? 1 : 0,
+                     strstr(resp, "OK") ? 1 : 0);
             ParsePduSmsResponse(resp);
+        } else {
+            DWORD nowTick = GetTickCount();
+            if (nowTick - lastIdleLogTick >= 15000) {
+                WriteLog("[接收主循环] 空闲中：连续未收包时长=%lu ms", (unsigned long)(nowTick - lastRxTick));
+                lastIdleLogTick = nowTick;
+            }
         }
         
         static DWORD lastPollTick = 0;
@@ -1475,9 +1534,18 @@ void ServiceWorkLoop() {
             memset(resp, 0, AT_BUF);
             if (!SerialWriteAll(hSerial, "AT+CMGL=4\r\n", 11)) {
                 WriteLog("[双保险主动轮询] 下发 AT+CMGL=4 失败，串口写入异常");
-            } else if (SerialCollectUntilQuiet(hSerial, resp, AT_BUF, 2200, 200) && strstr(resp, "+CMGL:")) {
-                WriteLog("[双保险主动轮询] 发现SIM卡内存在未处理的存量死角信息，强制召回同步");
+            } else if (SerialCollectUntilQuiet(hSerial, resp, AT_BUF, 2200, 200)) {
+                size_t pollLen = strlen(resp);
+                WriteLog("[双保险主动轮询] 收到轮询响应 %zu字节 CMT=%d CMGL=%d",
+                         pollLen,
+                         strstr(resp, "+CMT:") ? 1 : 0,
+                         strstr(resp, "+CMGL:") ? 1 : 0);
+                if (strstr(resp, "+CMGL:")) {
+                    WriteLog("[双保险主动轮询] 发现SIM卡内存在未处理的存量死角信息，强制召回同步");
+                }
                 ParsePduSmsResponse(resp);
+            } else {
+                WriteLog("[双保险主动轮询] 本轮轮询未收到有效回包");
             }
             lastPollTick = GetTickCount();
         }
