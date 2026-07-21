@@ -765,7 +765,7 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
             continue;
         }
 
-        WriteLog("[后台线程] 扫描待发送消息队列...");
+        // WriteLog("[后台线程] 扫描待发送消息队列...");
         const char *sql = "SELECT id, target_wxid, message_content FROM decoded_sms WHERE send_status = 0 ORDER BY id ASC LIMIT 50;";
         if (mysql_query(async_mysql, sql) == 0) {
             MYSQL_RES *res = mysql_store_result(async_mysql);
@@ -791,7 +791,7 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
                 }
                 mysql_free_result(res);
                 if (row_count == 0) {
-                    WriteLog("[后台线程] 队列为空，无待发送消息");
+                    ; // WriteLog("[后台线程] 队列为空，无待发送消息");
                 }
             } else {
                 WriteLog("[后台线程] mysql_store_result 返回 NULL");
