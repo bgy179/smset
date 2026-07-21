@@ -269,14 +269,37 @@ static BOOL SerialCollectUntilQuiet(HANDLE h, char *out, size_t out_cap,
     DWORD last_data_tick = start_tick;
     size_t total = 0;
     BOOL has_data = FALSE;
+    DWORD loopCount = 0;
 
     out[0] = '\0';
 
     while (GetTickCount() - start_tick < total_timeout_ms) {
         char chunk[BUF_LEN];
         DWORD got = 0;
+        DWORD errors = 0;
+        COMSTAT st;
+        ZeroMemory(&st, sizeof(st));
 
-        if (ReadFile(h, chunk, (DWORD)(sizeof(chunk) - 1), &got, NULL) && got > 0) {
+        loopCount++;
+
+        // Query bytes already queued by the driver to avoid long blocking reads.
+        if (!ClearCommError(h, &errors, &st)) {
+            Sleep(10);
+            continue;
+        }
+
+        if (st.cbInQue == 0) {
+            if (has_data && (GetTickCount() - last_data_tick >= idle_ms))
+                break;
+            Sleep(10);
+            continue;
+        }
+
+        DWORD toRead = (DWORD)(sizeof(chunk) - 1);
+        if (st.cbInQue < toRead) toRead = st.cbInQue;
+        if (toRead == 0) toRead = 1;
+
+        if (ReadFile(h, chunk, toRead, &got, NULL) && got > 0) {
             has_data = TRUE;
             last_data_tick = GetTickCount();
 
@@ -296,13 +319,49 @@ static BOOL SerialCollectUntilQuiet(HANDLE h, char *out, size_t out_cap,
             continue;
         }
 
-        if (has_data && (GetTickCount() - last_data_tick >= idle_ms))
-            break;
-
         Sleep(10);
     }
 
+    {
+        DWORD elapsed = GetTickCount() - start_tick;
+        if (elapsed > (total_timeout_ms + 1500)) {
+            WriteLog("[串口采集告警] 本次采集耗时异常 elapsed=%lu timeout=%lu loop=%lu has_data=%d bytes=%zu",
+                     (unsigned long)elapsed,
+                     (unsigned long)total_timeout_ms,
+                     (unsigned long)loopCount,
+                     has_data ? 1 : 0,
+                     total);
+        }
+    }
+
     return has_data;
+}
+
+static void BuildPreview(const char *src, char *dst, size_t dstSize) {
+    if (!dst || dstSize == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j + 2 < dstSize; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '\r') {
+            if (j + 2 < dstSize) {
+                dst[j++] = '\\';
+                dst[j++] = 'r';
+            }
+        } else if (c == '\n') {
+            if (j + 2 < dstSize) {
+                dst[j++] = '\\';
+                dst[j++] = 'n';
+            }
+        } else if (isprint(c)) {
+            dst[j++] = (char)c;
+        } else {
+            dst[j++] = '.';
+        }
+    }
+    dst[j] = '\0';
 }
 
 // ===================== 基础工具函数 =====================
@@ -1505,6 +1564,14 @@ void ServiceWorkLoop() {
         char resp[AT_BUF] = {0};
         static DWORD lastRxTick = 0;
         static DWORD lastIdleLogTick = 0;
+        static DWORD lastCnmiCheckTick = 0;
+        static int onlyOkPollStreak = 0;
+
+        if (lastRxTick == 0) {
+            lastRxTick = GetTickCount();
+            lastIdleLogTick = lastRxTick;
+            lastCnmiCheckTick = lastRxTick;
+        }
         
         if (!g_bDebugMode) {
             if (WaitForSingleObject(g_hStopEvent, 100) == WAIT_OBJECT_0) break; 
@@ -1536,18 +1603,60 @@ void ServiceWorkLoop() {
                 WriteLog("[双保险主动轮询] 下发 AT+CMGL=4 失败，串口写入异常");
             } else if (SerialCollectUntilQuiet(hSerial, resp, AT_BUF, 2200, 200)) {
                 size_t pollLen = strlen(resp);
+                char preview[256];
+                BuildPreview(resp, preview, sizeof(preview));
                 WriteLog("[双保险主动轮询] 收到轮询响应 %zu字节 CMT=%d CMGL=%d",
                          pollLen,
                          strstr(resp, "+CMT:") ? 1 : 0,
                          strstr(resp, "+CMGL:") ? 1 : 0);
+                WriteLog("[双保险主动轮询] 响应预览: %s", preview[0] ? preview : "<empty>");
                 if (strstr(resp, "+CMGL:")) {
                     WriteLog("[双保险主动轮询] 发现SIM卡内存在未处理的存量死角信息，强制召回同步");
+                    onlyOkPollStreak = 0;
+                } else if (strstr(resp, "+CMT:")) {
+                    onlyOkPollStreak = 0;
+                } else if (strstr(resp, "OK")) {
+                    onlyOkPollStreak++;
+                } else {
+                    onlyOkPollStreak = 0;
                 }
                 ParsePduSmsResponse(resp);
             } else {
                 WriteLog("[双保险主动轮询] 本轮轮询未收到有效回包");
+                onlyOkPollStreak = 0;
             }
             lastPollTick = GetTickCount();
+        }
+
+        {
+            DWORD nowTick = GetTickCount();
+            if (onlyOkPollStreak >= 20 && (nowTick - lastCnmiCheckTick >= 60000)) {
+                char chk[BUF_LEN] = {0};
+                char setAck[BUF_LEN] = {0};
+
+                WriteLog("[URC自愈] 连续%d轮轮询仅收到OK，触发CNMI自检与重置", onlyOkPollStreak);
+
+                if (SerialWriteAll(hSerial, "AT+CNMI?\r\n", 10) &&
+                    SerialCollectUntilQuiet(hSerial, chk, sizeof(chk), 1200, 120)) {
+                    char preview[256];
+                    BuildPreview(chk, preview, sizeof(preview));
+                    WriteLog("[URC自愈] AT+CNMI? 响应: %s", preview[0] ? preview : "<empty>");
+                } else {
+                    WriteLog("[URC自愈] AT+CNMI? 查询失败");
+                }
+
+                if (SerialWriteAll(hSerial, "AT+CNMI=2,2,0,0,0\r\n", 19) &&
+                    SerialCollectUntilQuiet(hSerial, setAck, sizeof(setAck), 1200, 120)) {
+                    char preview2[256];
+                    BuildPreview(setAck, preview2, sizeof(preview2));
+                    WriteLog("[URC自愈] CNMI重置响应: %s", preview2[0] ? preview2 : "<empty>");
+                } else {
+                    WriteLog("[URC自愈] CNMI重置失败，串口可能处于异常状态");
+                }
+
+                lastCnmiCheckTick = nowTick;
+                onlyOkPollStreak = 0;
+            }
         }
         
         run_garbage_collection();
