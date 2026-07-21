@@ -620,8 +620,14 @@ static int send_wechat_message(const char *wxid, const char *content) {
     if (!curl || !content) return -1;
 
     char new_content[4096]; 
-    const char *ptr_from = content; 
+    const char *marker = strstr(content, "=>| ");
+    const char *ptr_from = marker ? (marker + 4) : content;
     char *ptr_to = new_content;
+
+    if (!marker) {
+        WriteLog("[内容清洗] 文本中未检测到 '=>| ' 标记，复制起点为文本开头");
+    }
+    
     while(*ptr_from != '\0' && ptr_to < new_content + sizeof(new_content) - 1) {
         if(*ptr_from == '|' && *(ptr_from + 1) == ' ') {
             ptr_from += 2;
