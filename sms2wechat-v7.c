@@ -32,8 +32,8 @@
 #define MAX_WXID_PER_QUERY   64   
 #define RESP_BUF_INIT_SIZE   1024
 
-
-#define CONFIG_PATH        ".\\config.ini"
+#define CONFIG_FILENAME      "config.ini"
+#define LOG_FILENAME         "sms_service.log"
 #define BUF_LEN            1024
 #define AT_BUF             (128 * 1024)
 #define MAX_COM_NUM        6     
@@ -135,6 +135,7 @@ bool g_bDebugMode = false;
 static hash_table_t *g_cache = NULL;
 static pthread_rwlock_t g_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
 static AppConfig g_cfg;
+static char g_exe_dir[MAX_PATH] = {0};
 
 static void config_set_defaults(void) {
     snprintf(g_cfg.wechat_send_api_url, sizeof(g_cfg.wechat_send_api_url), "%s", DEFAULT_WECHAT_SEND_API_URL);
@@ -145,6 +146,26 @@ static void config_set_defaults(void) {
     snprintf(g_cfg.db_name, sizeof(g_cfg.db_name), "%s", DEFAULT_DB_NAME);
     snprintf(g_cfg.log_path, sizeof(g_cfg.log_path), "%s", DEFAULT_LOG_PATH);
     g_cfg.cache_refresh_interval_sec = DEFAULT_CACHE_REFRESH_INTERVAL_SEC;
+}
+
+static void init_exe_dir(void) {
+    DWORD len = GetModuleFileNameA(NULL, g_exe_dir, sizeof(g_exe_dir));
+    if (len == 0 || len >= sizeof(g_exe_dir)) {
+        strcpy(g_exe_dir, ".");
+        return;
+    }
+
+    char *slash = strrchr(g_exe_dir, '\\');
+    if (slash) {
+        *slash = '\0';
+    } else {
+        strcpy(g_exe_dir, ".");
+    }
+}
+
+static void build_path_in_exe_dir(char *out, size_t out_size, const char *name) {
+    if (!out || out_size == 0 || !name) return;
+    snprintf(out, out_size, "%s\\%s", g_exe_dir[0] ? g_exe_dir : ".", name);
 }
 
 static void trim_whitespace(char *s) {
@@ -207,6 +228,12 @@ static void load_config_file(const char *path) {
     }
 
     fclose(fp);
+}
+
+static void load_config_from_exe_dir(void) {
+    char config_path[MAX_PATH];
+    build_path_in_exe_dir(config_path, sizeof(config_path), CONFIG_FILENAME);
+    load_config_file(config_path);
 }
 
 static BOOL SerialWriteAll(HANDLE h, const char *buf, DWORD len) {
@@ -627,7 +654,7 @@ static int send_wechat_message(const char *wxid, const char *content) {
     if (!marker) {
         WriteLog("[内容清洗] 文本中未检测到 '=>| ' 标记，复制起点为文本开头");
     }
-    
+
     while(*ptr_from != '\0' && ptr_to < new_content + sizeof(new_content) - 1) {
         if(*ptr_from == '|' && *(ptr_from + 1) == ' ') {
             ptr_from += 2;
@@ -1347,8 +1374,7 @@ void ServiceWorkLoop() {
     WriteLog("[服务核心] ===============================================");
 
     while (1) {
-        char resp[AT_BUF] = {0}; 
-        DWORD r = 0;
+        char resp[AT_BUF] = {0};
         
         if (!g_bDebugMode) {
             if (WaitForSingleObject(g_hStopEvent, 100) == WAIT_OBJECT_0) break; 
@@ -1356,8 +1382,7 @@ void ServiceWorkLoop() {
             Sleep(100);
         }
 
-        if (ReadFile(hSerial, resp, AT_BUF - 1, &r, NULL) && r > 0) {
-            resp[r] = '\0';
+        if (SerialCollectUntilQuiet(hSerial, resp, sizeof(resp), 300, 50)) {
             ParsePduSmsResponse(resp);
         }
         
@@ -1391,9 +1416,16 @@ DWORD WINAPI ServiceHandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEvent
 }
 
 void CoreBusinessInit() {
+    init_exe_dir();
     config_set_defaults();
     
-    load_config_file(CONFIG_PATH);
+    load_config_from_exe_dir();
+
+    if (g_cfg.log_path[0] == '.' || strchr(g_cfg.log_path, ':') == NULL) {
+        char resolved_log_path[MAX_PATH];
+        build_path_in_exe_dir(resolved_log_path, sizeof(resolved_log_path), LOG_FILENAME);
+        snprintf(g_cfg.log_path, sizeof(g_cfg.log_path), "%s", resolved_log_path);
+    }
 
     log_fp = fopen(g_cfg.log_path, "a+");
     curl_global_init(CURL_GLOBAL_ALL);
