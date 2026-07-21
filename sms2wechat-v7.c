@@ -40,12 +40,12 @@
 #define AT_TEST_TIMEOUT    400
 #define SEGMENT_TIMEOUT_SEC 120  
 
-#define DEFAULT_WECHAT_SEND_API_URL  "http://192.168.136.1:8080/api/sendtxtmsg"
-#define DEFAULT_FALLBACK_WXID        "21168297171@chatroom"
-#define DEFAULT_DB_HOST              "192.168.18.130"
+#define DEFAULT_WECHAT_SEND_API_URL  "http://127.0.0.1:8080/api/sendtxtmsg"
+#define DEFAULT_FALLBACK_WXID        "21167291234@chatroom"
+#define DEFAULT_DB_HOST              "127.0.0.1"
 #define DEFAULT_DB_USER              "root"
-#define DEFAULT_DB_PASSWORD          "123456"
-#define DEFAULT_DB_NAME              "zbxalerts"
+#define DEFAULT_DB_PASSWORD          ""
+#define DEFAULT_DB_NAME              "alerts"
 #define DEFAULT_LOG_PATH             ".\\sms_service.log"
 #define DEFAULT_CACHE_REFRESH_INTERVAL_SEC 300
 
