@@ -1355,8 +1355,34 @@ void ParsePduSmsResponse(char* atResp) {
                     } else {
                         char tmp[BUF_LEN];
                         if (SerialCollectUntilQuiet(hSerial, tmp, sizeof(tmp), 600, 120)) {
-                            /* Keep parsing follow-up bytes; next segment may arrive during delete ack window. */
-                            ParsePduSmsResponse(tmp);
+                            /*
+                             * Do not recurse into ParsePduSmsResponse here: it uses static parser state.
+                             * Re-entrant calls can corrupt cursor/state and drop later segments.
+                             * Instead, append drained bytes to current stream and continue this loop.
+                             */
+                            size_t addLen = strlen(tmp);
+                            if (addLen > 0) {
+                                if (addLen >= sizeof(streamBuf)) {
+                                    tmp[sizeof(streamBuf) - 1] = '\0';
+                                    addLen = sizeof(streamBuf) - 1;
+                                }
+
+                                if (streamLen + addLen >= sizeof(streamBuf)) {
+                                    size_t drop2 = (streamLen + addLen) - (sizeof(streamBuf) - 1);
+                                    if (drop2 >= streamLen) {
+                                        streamLen = 0;
+                                    } else {
+                                        memmove(streamBuf, streamBuf + drop2, streamLen - drop2);
+                                        streamLen -= drop2;
+                                    }
+                                    streamBuf[streamLen] = '\0';
+                                    WriteLog("[串口缓冲] 删除应答阶段追加数据触发缓冲挤压，丢弃最旧 %zu 字节", drop2);
+                                }
+
+                                memcpy(streamBuf + streamLen, tmp, addLen);
+                                streamLen += addLen;
+                                streamBuf[streamLen] = '\0';
+                            }
                         }
                     }
                 }
