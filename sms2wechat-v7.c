@@ -623,8 +623,13 @@ static int send_wechat_message(const char *wxid, const char *content) {
     const char *ptr_from = content; 
     char *ptr_to = new_content;
     while(*ptr_from != '\0' && ptr_to < new_content + sizeof(new_content) - 1) {
-        if(*ptr_from != '|') { *ptr_to = *ptr_from; ptr_to++; }
-        ptr_from++;
+        if(*ptr_from == '|' && *(ptr_from + 1) == ' ') {
+            ptr_from += 2;
+        } else { 
+            *ptr_to = *ptr_from; 
+            ptr_to++; 
+            ptr_from++;
+        }
     }
     *ptr_to = '\0';
 
