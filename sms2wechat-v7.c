@@ -26,8 +26,6 @@
 #define BAUD_RATE          CBR_115200
 #define DB_PORT         3306
 
-#define POLL_INTERVAL                3000  /* 保险串口轮询间隔 (毫秒) */
-
 #define HASH_BUCKET_COUNT    1024
 #define MAX_WXID_PER_QUERY   64   
 #define RESP_BUF_INIT_SIZE   1024
@@ -138,6 +136,8 @@ static hash_table_t *g_cache = NULL;
 static pthread_rwlock_t g_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
 static AppConfig g_cfg;
 static char g_exe_dir[MAX_PATH] = {0};
+
+void WriteLog(const char* fmt, ...);
 
 static void config_set_defaults(void) {
     snprintf(g_cfg.wechat_send_api_url, sizeof(g_cfg.wechat_send_api_url), "%s", DEFAULT_WECHAT_SEND_API_URL);
@@ -1369,11 +1369,10 @@ void run_garbage_collection() {
     }
 }
 
-// ===================== 重构解析器，完美融合兼容 +CMGL 和 +CMT =====================
+// ===================== 解析器：仅处理 URC +CMT 实时上报 =====================
 void ParsePduSmsResponse(char* atResp) {
     static char streamBuf[AT_BUF];
     static size_t streamLen = 0;
-    static int currentMsgIndex = -1;
     static bool isLiveCmtReport = false;
     static DWORD lastPartialLogTick = 0;
 
@@ -1382,9 +1381,9 @@ void ParsePduSmsResponse(char* atResp) {
     size_t inLen = strlen(atResp);
     if (inLen == 0) return;
 
-    if (strstr(atResp, "+CMT:") || strstr(atResp, "+CMGL:") || strstr(atResp, "ERROR")) {
-        WriteLog("[解析入口] 收到关键串口片段 %zu字节 idx=%d cmt=%d",
-                 inLen, currentMsgIndex, isLiveCmtReport ? 1 : 0);
+    if (strstr(atResp, "+CMT:") || strstr(atResp, "ERROR")) {
+        WriteLog("[解析入口] 收到关键串口片段 %zu字节 cmt=%d",
+                 inLen, isLiveCmtReport ? 1 : 0);
     }
 
     if (inLen >= sizeof(streamBuf)) {
@@ -1426,21 +1425,15 @@ void ParsePduSmsResponse(char* atResp) {
 
             if (strstr(line, "+CIEV:") != NULL) {
                 /* Ignore noisy modem indication lines unrelated to SMS payload. */
-            } else if (strstr(line, "+CMGL:") != NULL) {
-                sscanf_s(line, "+CMGL: %d,", &currentMsgIndex);
-                isLiveCmtReport = false;
-                WriteLog("[数据流流向] 判定输出为 -> [定时巡检历史缓存]，解析索引坑位: %d", currentMsgIndex);
             } else if (strstr(line, "+CMT:") != NULL) {
-                currentMsgIndex = -1;
                 isLiveCmtReport = true;
                 WriteLog("[数据流流向] 判定输出为 -> [实时主动通知上报 (+CMT事件)]");
-            } else if ((currentMsgIndex != -1 || isLiveCmtReport) && strlen(line) > 10 && !strstr(line, "OK")) {
+            } else if (isLiveCmtReport && strlen(line) > 10 && !strstr(line, "OK")) {
                 WriteLog("[数据落库] PDU原始串送入缓冲层: %s", line);
                 char sql[AT_BUF + 256], raw_esc[AT_BUF];
                 mysql_real_escape_string(mysql, raw_esc, line, strlen(line));
 
-                int savedIndex = (currentMsgIndex != -1) ? currentMsgIndex : 0;
-                sprintf(sql, "INSERT INTO raw_sms(msg_index, raw_content, status) VALUES(%d, '%s', 0)", savedIndex, raw_esc);
+                sprintf(sql, "INSERT INTO raw_sms(msg_index, raw_content, status) VALUES(0, '%s', 0)", raw_esc);
 
                 if (mysql_query(mysql, sql) == 0) {
                     int last_id = (int)mysql_insert_id(mysql);
@@ -1455,27 +1448,10 @@ void ParsePduSmsResponse(char* atResp) {
                     WriteLog("[数据库异常] 写入原始数据表 raw_sms 发生阻塞错误: %s", mysql_error(mysql));
                 }
 
-                if (currentMsgIndex != -1) {
-                    char delCmd[64];
-                    sprintf_s(delCmd, sizeof(delCmd), "AT+CMGD=%d\r\n", currentMsgIndex);
-                    WriteLog("[芯片清理] 正在对SIM卡槽的存储数据进行腾空，发送指令: AT+CMGD=%d", currentMsgIndex);
-                    if (!SerialWriteAll(hSerial, delCmd, (DWORD)strlen(delCmd))) {
-                        WriteLog("[芯片清理] 删除短信指令下发失败，串口写入异常");
-                    } else {
-                        /*
-                         * Do not synchronously read delete ACK here.
-                         * Let the main receive loop collect all bytes uniformly,
-                         * otherwise CMGD ACK/URC interleaving can stall or starve new SMS parsing.
-                         */
-                    }
-                }
-
-                currentMsgIndex = -1;
                 isLiveCmtReport = false;
-                WriteLog("[解析状态] 当前PDU处理闭环结束，状态复位 idx=%d cmt=%d", currentMsgIndex, isLiveCmtReport ? 1 : 0);
+                WriteLog("[解析状态] 当前PDU处理闭环结束，状态复位 cmt=%d", isLiveCmtReport ? 1 : 0);
             } else if (strlen(line) > 0 && strstr(line, "OK") == NULL && strstr(line, "+CIEV:") == NULL) {
-                WriteLog("[解析旁路] 行未进入PDU流程 idx=%d cmt=%d line=%s",
-                         currentMsgIndex,
+                WriteLog("[解析旁路] 行未进入PDU流程 cmt=%d line=%s",
                          isLiveCmtReport ? 1 : 0,
                          line);
             }
@@ -1487,8 +1463,8 @@ void ParsePduSmsResponse(char* atResp) {
     }
 
     if (parsedLineCount > 0) {
-        WriteLog("[解析统计] 本轮解析完成 行数=%zu 剩余缓冲=%zu idx=%d cmt=%d",
-                 parsedLineCount, streamLen - cursor, currentMsgIndex, isLiveCmtReport ? 1 : 0);
+        WriteLog("[解析统计] 本轮解析完成 行数=%zu 剩余缓冲=%zu cmt=%d",
+                 parsedLineCount, streamLen - cursor, isLiveCmtReport ? 1 : 0);
     }
 
     if (cursor == 0 && streamLen > 0) {
@@ -1565,12 +1541,14 @@ void ServiceWorkLoop() {
         static DWORD lastRxTick = 0;
         static DWORD lastIdleLogTick = 0;
         static DWORD lastCnmiCheckTick = 0;
+        static DWORD lastSmsEventTick = 0;
         static int onlyOkPollStreak = 0;
 
         if (lastRxTick == 0) {
             lastRxTick = GetTickCount();
             lastIdleLogTick = lastRxTick;
             lastCnmiCheckTick = lastRxTick;
+            lastSmsEventTick = lastRxTick;
         }
         
         if (!g_bDebugMode) {
@@ -1582,11 +1560,17 @@ void ServiceWorkLoop() {
         if (SerialCollectUntilQuiet(hSerial, resp, sizeof(resp), 300, 50)) {
             size_t rxLen = strlen(resp);
             lastRxTick = GetTickCount();
-            WriteLog("[接收主循环] 本轮串口收包 %zu字节 CMT=%d CMGL=%d OK=%d",
-                     rxLen,
-                     strstr(resp, "+CMT:") ? 1 : 0,
-                     strstr(resp, "+CMGL:") ? 1 : 0,
-                     strstr(resp, "OK") ? 1 : 0);
+            int hasCmt = strstr(resp, "+CMT:") ? 1 : 0;
+            int hasOk = strstr(resp, "OK") ? 1 : 0;
+            WriteLog("[接收主循环] 本轮串口收包 %zu字节 CMT=%d OK=%d",
+                     rxLen, hasCmt, hasOk);
+
+            if (hasCmt) {
+                lastSmsEventTick = lastRxTick;
+                onlyOkPollStreak = 0;
+            } else if (hasOk) {
+                onlyOkPollStreak++;
+            }
             ParsePduSmsResponse(resp);
         } else {
             DWORD nowTick = GetTickCount();
@@ -1596,45 +1580,25 @@ void ServiceWorkLoop() {
             }
         }
         
-        static DWORD lastPollTick = 0;
-        if (GetTickCount() - lastPollTick >= POLL_INTERVAL) {
-            memset(resp, 0, AT_BUF);
-            if (!SerialWriteAll(hSerial, "AT+CMGL=4\r\n", 11)) {
-                WriteLog("[双保险主动轮询] 下发 AT+CMGL=4 失败，串口写入异常");
-            } else if (SerialCollectUntilQuiet(hSerial, resp, AT_BUF, 2200, 200)) {
-                size_t pollLen = strlen(resp);
-                char preview[256];
-                BuildPreview(resp, preview, sizeof(preview));
-                WriteLog("[双保险主动轮询] 收到轮询响应 %zu字节 CMT=%d CMGL=%d",
-                         pollLen,
-                         strstr(resp, "+CMT:") ? 1 : 0,
-                         strstr(resp, "+CMGL:") ? 1 : 0);
-                WriteLog("[双保险主动轮询] 响应预览: %s", preview[0] ? preview : "<empty>");
-                if (strstr(resp, "+CMGL:")) {
-                    WriteLog("[双保险主动轮询] 发现SIM卡内存在未处理的存量死角信息，强制召回同步");
-                    onlyOkPollStreak = 0;
-                } else if (strstr(resp, "+CMT:")) {
-                    onlyOkPollStreak = 0;
-                } else if (strstr(resp, "OK")) {
-                    onlyOkPollStreak++;
-                } else {
-                    onlyOkPollStreak = 0;
-                }
-                ParsePduSmsResponse(resp);
-            } else {
-                WriteLog("[双保险主动轮询] 本轮轮询未收到有效回包");
-                onlyOkPollStreak = 0;
-            }
-            lastPollTick = GetTickCount();
-        }
-
         {
             DWORD nowTick = GetTickCount();
-            if (onlyOkPollStreak >= 20 && (nowTick - lastCnmiCheckTick >= 60000)) {
+            DWORD noSmsMs = nowTick - lastSmsEventTick;
+            if (noSmsMs >= 60000 && (nowTick - lastCnmiCheckTick >= 60000)) {
                 char chk[BUF_LEN] = {0};
                 char setAck[BUF_LEN] = {0};
+                char cpms[BUF_LEN] = {0};
 
-                WriteLog("[URC自愈] 连续%d轮轮询仅收到OK，触发CNMI自检与重置", onlyOkPollStreak);
+                WriteLog("[URC自愈] 连续%lu ms 未检测到 +CMT，触发CNMI自检与重置（OK计数=%d）",
+                         (unsigned long)noSmsMs, onlyOkPollStreak);
+
+                if (SerialWriteAll(hSerial, "AT+CPMS?\r\n", 10) &&
+                    SerialCollectUntilQuiet(hSerial, cpms, sizeof(cpms), 1200, 120)) {
+                    char p0[256];
+                    BuildPreview(cpms, p0, sizeof(p0));
+                    WriteLog("[URC自愈] AT+CPMS? 响应: %s", p0[0] ? p0 : "<empty>");
+                } else {
+                    WriteLog("[URC自愈] AT+CPMS? 查询失败");
+                }
 
                 if (SerialWriteAll(hSerial, "AT+CNMI?\r\n", 10) &&
                     SerialCollectUntilQuiet(hSerial, chk, sizeof(chk), 1200, 120)) {
