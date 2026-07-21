@@ -38,7 +38,6 @@
 #define AT_BUF             (128 * 1024)
 #define MAX_COM_NUM        6     
 #define AT_TEST_TIMEOUT    400
-#define SEGMENT_TIMEOUT_SEC 120  
 
 #define DEFAULT_WECHAT_SEND_API_URL  "http://127.0.0.1:8080/api/sendtxtmsg"
 #define DEFAULT_FALLBACK_WXID        "21167291234@chatroom"
@@ -48,6 +47,7 @@
 #define DEFAULT_DB_NAME              "alerts"
 #define DEFAULT_LOG_PATH             ".\\sms_service.log"
 #define DEFAULT_CACHE_REFRESH_INTERVAL_SEC 300
+#define DEFAULT_SEGMENT_TIMEOUT_SEC 120
 
 // ===================== 数据结构定义 =====================
 typedef struct {
@@ -73,6 +73,7 @@ typedef struct PendingSMS {
     char sender[32];
     uint16_t ref_num;
     bool is_16bit_ref;
+    uint8_t dcs;
     uint8_t total_parts;
     uint8_t arrived_count;
     time_t first_seen;
@@ -117,6 +118,7 @@ typedef struct {
     char db_name[64];
     char log_path[260];
     int cache_refresh_interval_sec;
+    int segment_timeout_sec;
 } AppConfig;
 
 // ===================== 全局变量 =====================
@@ -146,6 +148,7 @@ static void config_set_defaults(void) {
     snprintf(g_cfg.db_name, sizeof(g_cfg.db_name), "%s", DEFAULT_DB_NAME);
     snprintf(g_cfg.log_path, sizeof(g_cfg.log_path), "%s", DEFAULT_LOG_PATH);
     g_cfg.cache_refresh_interval_sec = DEFAULT_CACHE_REFRESH_INTERVAL_SEC;
+    g_cfg.segment_timeout_sec = DEFAULT_SEGMENT_TIMEOUT_SEC;
 }
 
 static void init_exe_dir(void) {
@@ -202,6 +205,9 @@ static void config_apply_kv(const char *key, const char *value) {
     } else if (_stricmp(key, "CACHE_REFRESH_INTERVAL_SEC") == 0 || _stricmp(key, "CACH_REFRESH_INTERVAL") == 0) {
         int sec = atoi(value);
         if (sec > 0) g_cfg.cache_refresh_interval_sec = sec;
+    } else if (_stricmp(key, "SEGMENT_TIMEOUT_SEC") == 0) {
+        int sec = atoi(value);
+        if (sec > 0) g_cfg.segment_timeout_sec = sec;
     }
 }
 
@@ -1104,6 +1110,53 @@ void free_pending_sms(PendingSMS *node) {
     free(node);
 }
 
+static void flush_incomplete_pending_sms(PendingSMS *node) {
+    if (!node || node->arrived_count == 0 || !node->parts_head) return;
+
+    size_t total = 0;
+    for (SMSPartNode *p = node->parts_head; p; p = p->next) {
+        total += p->data_len;
+    }
+
+    if (total == 0) return;
+
+    uint8_t *full = (uint8_t *)malloc(total);
+    if (!full) return;
+
+    size_t off = 0;
+    for (SMSPartNode *p = node->parts_head; p; p = p->next) {
+        memcpy(full + off, p->data, p->data_len);
+        off += p->data_len;
+    }
+
+    char *utf8 = (char *)malloc(total * 3 + 64);
+    if (!utf8) {
+        free(full);
+        return;
+    }
+
+    bool success = false;
+    if ((node->dcs & 0x0C) == 0x00) {
+        success = gsm7bit_to_utf8(full, total, utf8, total * 3 + 1, 0);
+    } else {
+        success = ucs2be_to_utf8(full, total, utf8, total * 3 + 1);
+    }
+
+    if (success) {
+        char *final_msg = (char *)malloc(strlen(utf8) + 96);
+        if (final_msg) {
+            snprintf(final_msg, strlen(utf8) + 96,
+                     "[PARTIAL %d/%d] %s",
+                     node->arrived_count, node->total_parts, utf8);
+            dispatch_decoded_sms(node->sender, node->ref_num, node->is_16bit_ref, final_msg);
+            free(final_msg);
+        }
+    }
+
+    free(full);
+    free(utf8);
+}
+
 void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
     if (!frame->is_concat) {
         char utf8_buf[4096];
@@ -1136,6 +1189,7 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
         strcpy(target->sender, frame->sender);
         target->ref_num = frame->ref_num; 
         target->is_16bit_ref = frame->is_16bit_ref;
+        target->dcs = frame->dcs;
         target->total_parts = frame->total_parts; 
         target->first_seen = time(NULL);
         target->next = pending_queue_head; 
@@ -1203,9 +1257,10 @@ void run_garbage_collection() {
     time_t now = time(NULL); PendingSMS *curr = pending_queue_head;
     while(curr) { 
         PendingSMS *next = curr->next; 
-        if(now - curr->first_seen > SEGMENT_TIMEOUT_SEC) { 
+        if(now - curr->first_seen > g_cfg.segment_timeout_sec) { 
             WriteLog("[内存降噪] 发现超时的残缺长短信片段（Ref: %d, 号码: %s），执行强行销毁清洗", 
                      curr->ref_num, curr->sender);
+            flush_incomplete_pending_sms(curr);
             free_pending_sms(curr); 
         } 
         curr = next; 
@@ -1299,7 +1354,10 @@ void ParsePduSmsResponse(char* atResp) {
                         WriteLog("[芯片清理] 删除短信指令下发失败，串口写入异常");
                     } else {
                         char tmp[BUF_LEN];
-                        SerialCollectUntilQuiet(hSerial, tmp, sizeof(tmp), 600, 120);
+                        if (SerialCollectUntilQuiet(hSerial, tmp, sizeof(tmp), 600, 120)) {
+                            /* Keep parsing follow-up bytes; next segment may arrive during delete ack window. */
+                            ParsePduSmsResponse(tmp);
+                        }
                     }
                 }
 
@@ -1437,7 +1495,8 @@ void CoreBusinessInit() {
     WriteLog("[配置] WECHAT_SEND_API_URL=%s", g_cfg.wechat_send_api_url);
     WriteLog("[配置] FALLBACK_WXID=%s", g_cfg.fallback_wxid);
     WriteLog("[配置] DB_HOST=%s DB_NAME=%s DB_USER=%s", g_cfg.db_host, g_cfg.db_name, g_cfg.db_user);
-    WriteLog("[配置] LOG_PATH=%s CACHE_REFRESH_INTERVAL_SEC=%d", g_cfg.log_path, g_cfg.cache_refresh_interval_sec);
+    WriteLog("[配置] LOG_PATH=%s CACHE_REFRESH_INTERVAL_SEC=%d SEGMENT_TIMEOUT_SEC=%d",
+             g_cfg.log_path, g_cfg.cache_refresh_interval_sec, g_cfg.segment_timeout_sec);
 
     WriteLog("[核心装载] ----------------------------------------------------");
     WriteLog("[核心装载] 初始化事件触发：正在全量拉取MySQL本地路由映射表数据...");
