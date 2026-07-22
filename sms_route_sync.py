@@ -16,8 +16,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import shlex
+import signal
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -43,7 +47,11 @@ USED_CONFIG_KEYS = {
     "DB_PASSWORD",
     "ALLOWED_SENDERS",
     "INTERVAL_SECONDS",
+    "LOG_FILE",
+    "PID_FILE",
 }
+
+STOP_REQUESTED = False
 
 
 @dataclass
@@ -61,6 +69,8 @@ class AppConfig:
     error_status: int
     allowed_senders: Set[str]
     interval_seconds: int
+    log_file: str
+    pid_file: str
 
 
 @dataclass
@@ -72,18 +82,145 @@ class SmsCommand:
     ip_list: List[str]
 
 
-def setup_logging(level_name: str) -> None:
+def setup_logging(level_name: str, log_file: str, enable_console: bool = True) -> None:
     """Configure global logging format and level.
 
     Args:
         level_name: One of DEBUG/INFO/WARNING/ERROR/CRITICAL (case-insensitive).
+        log_file: Log file path for file output.
+        enable_console: Whether to enable console log output.
     """
     level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    root_logger.handlers.clear()
+
+    if enable_console:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    LOGGER.info(
+        "Logging configured. level=%s file=%s console=%s",
+        level_name.upper(),
+        log_file,
+        enable_console,
+    )
+
+
+def request_stop(signum: int, _frame: Any) -> None:
+    """Signal handler to stop service loop gracefully."""
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    LOGGER.warning("Stop requested by signal=%s", signum)
+
+
+def register_signal_handlers() -> None:
+    """Register process signal handlers for graceful shutdown."""
+    signal.signal(signal.SIGINT, request_stop)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_stop)
+
+
+def ensure_single_instance(pid_file: str) -> int | None:
+    """Create PID file if no running instance exists; return existing PID otherwise."""
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            existing_pid = int(raw)
+        except Exception:
+            existing_pid = None
+
+        if existing_pid:
+            try:
+                os.kill(existing_pid, 0)
+                return existing_pid
+            except OSError:
+                LOGGER.warning("Removing stale PID file: %s", pid_file)
+                os.remove(pid_file)
+        else:
+            LOGGER.warning("Removing invalid PID file: %s", pid_file)
+            os.remove(pid_file)
+
+    pid_dir = os.path.dirname(pid_file)
+    if pid_dir:
+        os.makedirs(pid_dir, exist_ok=True)
+    with open(pid_file, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+    return None
+
+
+def remove_pid_file(pid_file: str) -> None:
+    """Best-effort PID file cleanup."""
+    try:
+        if os.path.exists(pid_file):
+            os.remove(pid_file)
+    except OSError as exc:
+        LOGGER.warning("Failed to remove PID file %s: %s", pid_file, exc)
+
+
+def launch_detached_child(args: argparse.Namespace) -> int:
+    """Launch detached background child process on Windows and return immediately."""
+    child_argv = [
+        arg
+        for arg in sys.argv[1:]
+        if arg not in ("--daemon", "--stop")
+    ]
+    child_argv.append("--daemon-child")
+    cmd = [sys.executable, os.path.abspath(__file__), *child_argv]
+
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+
+    LOGGER.info("Launching detached child process: %s", cmd)
+    subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        close_fds=True,
+        cwd=os.getcwd(),
+    )
+    return 0
+
+
+def stop_background_process(pid_file: str) -> int:
+    """Stop background process by PID file."""
+    if not os.path.exists(pid_file):
+        print(f"PID file not found: {pid_file}")
+        return 1
+
+    try:
+        with open(pid_file, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except Exception as exc:
+        print(f"Invalid PID file {pid_file}: {exc}")
+        return 1
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"Stop signal sent to PID {pid}")
+        return 0
+    except OSError as exc:
+        print(f"Failed to stop PID {pid}: {exc}")
+        return 1
 
 
 def parse_flat_ini(path: str) -> Dict[str, str]:
@@ -517,6 +654,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run only one sync cycle and exit.",
     )
+    p.add_argument(
+        "--log-file",
+        default="sms_route_sync.log",
+        help="Path to log file. Logs are written to both console and this file.",
+    )
+    p.add_argument(
+        "--pid-file",
+        default="sms_route_sync.pid",
+        help="Path to PID file for background watchdog process.",
+    )
+    p.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Start as detached background watchdog process (no console required).",
+    )
+    p.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop detached background watchdog process using --pid-file.",
+    )
+    p.add_argument(
+        "--daemon-child",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return p
 
 
@@ -531,10 +693,12 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         args.allowed_senders or cfg.get("ALLOWED_SENDERS", "")
     )
     interval_seconds = args.interval_seconds or int(cfg.get("INTERVAL_SECONDS", "60"))
+    log_file = args.log_file or cfg.get("LOG_FILE", "sms_route_sync.log")
+    pid_file = args.pid_file or cfg.get("PID_FILE", "sms_route_sync.pid")
     if interval_seconds <= 0:
         interval_seconds = 60
     LOGGER.debug(
-        "Config loaded. whitelist_size=%d db_host=%s db_port=%d api_url=%s batch_size=%d interval_seconds=%d success_status=%d error_status=%d",
+        "Config loaded. whitelist_size=%d db_host=%s db_port=%d api_url=%s batch_size=%d interval_seconds=%d success_status=%d error_status=%d log_file=%s pid_file=%s",
         len(allowed_senders),
         db_host,
         db_port,
@@ -543,6 +707,8 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         interval_seconds,
         args.success_status,
         args.error_status,
+        log_file,
+        pid_file,
     )
 
     return AppConfig(
@@ -557,6 +723,8 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         error_status=args.error_status,
         allowed_senders=allowed_senders,
         interval_seconds=interval_seconds,
+        log_file=log_file,
+        pid_file=pid_file,
     )
 
 
@@ -729,9 +897,26 @@ def main() -> int:
     """Run as a long-running service and execute one cycle per interval."""
     parser = build_parser()
     args = parser.parse_args()
-    setup_logging(args.log_level)
-    LOGGER.info("Program started with args=%s", vars(args))
+    if args.stop:
+        cfg = load_config(args)
+        return stop_background_process(cfg.pid_file)
+
+    if args.daemon and not args.daemon_child:
+        cfg = load_config(args)
+        setup_logging(args.log_level, cfg.log_file, enable_console=True)
+        return launch_detached_child(args)
+
     cfg = load_config(args)
+    setup_logging(args.log_level, cfg.log_file, enable_console=not args.daemon_child)
+    register_signal_handlers()
+
+    existing_pid = ensure_single_instance(cfg.pid_file)
+    if existing_pid:
+        LOGGER.error("Another instance is already running. pid=%s pid_file=%s", existing_pid, cfg.pid_file)
+        return 1
+
+    LOGGER.info("PID file created: %s pid=%s", cfg.pid_file, os.getpid())
+    LOGGER.info("Program started with args=%s", vars(args))
 
     LOGGER.info(
         "Starting sync service. source=%s.%s target=%s.%s batch_size=%d interval=%ds",
@@ -753,10 +938,13 @@ def main() -> int:
 
     if args.run_once:
         LOGGER.info("Run-once mode enabled")
-        return run_sync_cycle(cfg)
+        try:
+            return run_sync_cycle(cfg)
+        finally:
+            remove_pid_file(cfg.pid_file)
 
     try:
-        while True:
+        while not STOP_REQUESTED:
             cycle_started_at = time.time()
             LOGGER.info("Service loop iteration started")
             try:
@@ -770,10 +958,19 @@ def main() -> int:
             LOGGER.info("Service loop iteration finished: elapsed=%.3fs", elapsed)
             wait_seconds = max(0.0, float(cfg.interval_seconds) - elapsed)
             LOGGER.info("Sleeping %.1f seconds before next cycle", wait_seconds)
-            time.sleep(wait_seconds)
+            sleep_end = time.time() + wait_seconds
+            while time.time() < sleep_end:
+                if STOP_REQUESTED:
+                    break
+                time.sleep(min(0.5, max(0.0, sleep_end - time.time())))
     except KeyboardInterrupt:
         LOGGER.info("Service stopped by user")
         return 0
+    finally:
+        remove_pid_file(cfg.pid_file)
+        LOGGER.info("Service exited. PID file removed: %s", cfg.pid_file)
+
+    return 0
 
 
 if __name__ == "__main__":
