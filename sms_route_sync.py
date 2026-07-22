@@ -3,10 +3,10 @@
 Process SMS command rows from zbxalerts.decoded_sms and insert WeChat chatroom mappings.
 
 Flow:
-1. Read pending rows where status/send_status == 0.
+1. Read pending rows from decoded_sms where send_status == 0.
 2. Parse command in the format: _smsRoute <nick_name>
 3. Query wxid from local HTTP API: http://127.0.0.1:8080/api/execSql
-4. Insert into wzwmonitor.wechat_chatroom(wxid, nick_name|nickname, tenantname=wxid)
+4. Insert into wzwmonitor.wechat_chatroom(wxid, nickname, chatroom_type, tenantname=wxid)
 5. Mark source row as processed.
 """
 
@@ -32,6 +32,11 @@ except ImportError as exc:  # pragma: no cover
 
 LOGGER = logging.getLogger("sms_route_sync")
 
+SOURCE_ID_COLUMN = "id"
+SOURCE_MESSAGE_COLUMN = "message_content"
+SOURCE_STATUS_COLUMN = "send_status"
+SOURCE_SENDER_COLUMN = "sender"
+
 
 @dataclass
 class AppConfig:
@@ -51,6 +56,7 @@ class AppConfig:
     http_timeout: float
     success_status: int
     error_status: int
+    chatroom_type: str
     sender_column: Optional[str]
     allowed_senders: Set[str]
 
@@ -233,45 +239,41 @@ def lookup_chatroom_wxid(
 
 def insert_chatroom_row(
     conn: pymysql.connections.Connection,
-    schema: str,
-    table: str,
     wxid: str,
     nick_name: str,
+    chatroom_type: str,
     tenantname: str,
 ) -> None:
-    """Insert one mapping row into wechat_chatroom table.
+    """Insert or update one mapping row in wechat_chatroom.
 
-    Tries column `nick_name` first, and falls back to `nickname` for compatibility.
+    The live schema uses primary key `wxid`, `nickname`, required `chatroom_type`, and
+    `tenantname`, so repeated commands should refresh the existing row instead of failing.
     """
-    sql_nick_name = (
-        f"INSERT INTO `{schema}`.`{table}` (wxid, nick_name, tenantname) VALUES (%s, %s, %s)"
-    )
-    sql_nickname = (
-        f"INSERT INTO `{schema}`.`{table}` (wxid, nickname, tenantname) VALUES (%s, %s, %s)"
+    sql = (
+        "INSERT INTO `wzwmonitor`.`wechat_chatroom` "
+        "(wxid, nickname, chatroom_type, tenantname) "
+        "VALUES (%s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE "
+        "nickname=VALUES(nickname), "
+        "chatroom_type=VALUES(chatroom_type), "
+        "tenantname=VALUES(tenantname), "
+        "update_time=CURRENT_TIMESTAMP"
     )
 
     with conn.cursor() as cur:
-        try:
-            cur.execute(sql_nick_name, (wxid, nick_name, tenantname))
-        except pymysql.err.ProgrammingError as exc:
-            # Compatibility fallback for schema using `nickname`.
-            if "nick_name" in str(exc):
-                cur.execute(sql_nickname, (wxid, nick_name, tenantname))
-            else:
-                raise
+        cur.execute(sql, (wxid, nick_name, chatroom_type, tenantname))
 
 
 def update_sms_status(
     conn: pymysql.connections.Connection,
-    schema: str,
-    table: str,
-    id_col: str,
-    status_col: str,
     row_id: int,
     new_status: int,
 ) -> None:
     """Update one decoded_sms row status after processing."""
-    sql = f"UPDATE `{schema}`.`{table}` SET `{status_col}`=%s WHERE `{id_col}`=%s"
+    sql = (
+        "UPDATE `zbxalerts`.`decoded_sms` "
+        "SET `send_status`=%s WHERE `id`=%s"
+    )
     with conn.cursor() as cur:
         cur.execute(sql, (new_status, row_id))
 
@@ -284,20 +286,25 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     p.add_argument("--config", default="config.ini", help="Path to flat key=value config file")
-    p.add_argument("--db-host")
-    p.add_argument("--db-port", type=int)
-    p.add_argument("--db-user")
-    p.add_argument("--db-password")
+    p.add_argument("--db-host", default="192.168.18.130")
+    p.add_argument("--db-port", type=int, default=3306)
+    p.add_argument("--db-user", default="root")
+    p.add_argument("--db-password", default="123456")
     p.add_argument("--source-schema", default="zbxalerts")
     p.add_argument("--source-table", default="decoded_sms")
     p.add_argument("--target-schema", default="wzwmonitor")
     p.add_argument("--target-table", default="wechat_chatroom")
-    p.add_argument("--api-url", default="http://127.0.0.1:8080/api/execSql")
+    p.add_argument("--api-url", default="http://192.168.136.1:8080/api/execSql")
     p.add_argument("--wechat-db-name", default="MicroMsg")
     p.add_argument("--batch-size", type=int, default=100)
     p.add_argument("--http-timeout", type=float, default=5.0)
     p.add_argument("--success-status", type=int, default=1)
     p.add_argument("--error-status", type=int, default=-1)
+    p.add_argument(
+        "--chatroom-type",
+        default="sms_route",
+        help="Value written to wechat_chatroom.chatroom_type.",
+    )
     p.add_argument(
         "--sender-column",
         help="Override sender column name in decoded_sms (e.g. sender_number/phone).",
@@ -305,6 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--allowed-senders",
         help="Comma-separated sender whitelist. Only these senders are treated as commands.",
+        default="8618710029810,8618612310179",
     )
     p.add_argument(
         "--log-level",
@@ -350,6 +358,7 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         http_timeout=args.http_timeout,
         success_status=args.success_status,
         error_status=args.error_status,
+        chatroom_type=args.chatroom_type,
         sender_column=sender_column,
         allowed_senders=allowed_senders,
     )
@@ -387,52 +396,20 @@ def main() -> int:
     )
 
     try:
-        id_col = find_first_existing_column(conn, cfg.source_schema, cfg.source_table, ["id"])
-        msg_col = find_first_existing_column(
-            conn,
-            cfg.source_schema,
-            cfg.source_table,
-            ["message_content", "content", "sms_content", "message"],
-        )
-        status_col = find_first_existing_column(
-            conn,
-            cfg.source_schema,
-            cfg.source_table,
-            ["status", "send_status"],
-        )
-        sender_col = cfg.sender_column or find_first_existing_column(
-            conn,
-            cfg.source_schema,
-            cfg.source_table,
-            [
-                "sender_number",
-                "sender",
-                "phone",
-                "mobile",
-                "src",
-                "originator",
-            ],
-        )
+        sender_col = cfg.sender_column or SOURCE_SENDER_COLUMN
 
-        if not id_col or not msg_col or not status_col:
-            raise RuntimeError(
-                "Cannot detect source table columns. "
-                f"Detected: id={id_col}, message={msg_col}, status={status_col}"
-            )
-        if cfg.allowed_senders and not sender_col:
-            raise RuntimeError(
-                "Allowed sender whitelist is configured but sender column is not found. "
-                "Use --sender-column or set SENDER_COLUMN in config.ini."
-            )
         LOGGER.info(
             "Resolved columns. id=%s message=%s status=%s sender=%s",
-            id_col,
-            msg_col,
-            status_col,
+            SOURCE_ID_COLUMN,
+            SOURCE_MESSAGE_COLUMN,
+            SOURCE_STATUS_COLUMN,
             sender_col,
         )
 
-        select_fields = [f"`{id_col}` AS row_id", f"`{msg_col}` AS message"]
+        select_fields = [
+            f"`{SOURCE_ID_COLUMN}` AS row_id",
+            f"`{SOURCE_MESSAGE_COLUMN}` AS message",
+        ]
         if sender_col:
             select_fields.append(f"`{sender_col}` AS sender")
 
@@ -440,8 +417,8 @@ def main() -> int:
             "SELECT "
             + ", ".join(select_fields)
             + f" FROM `{cfg.source_schema}`.`{cfg.source_table}` "
-            + f"WHERE `{status_col}`=0 "
-            + f"ORDER BY `{id_col}` ASC LIMIT %s"
+            + f"WHERE `{SOURCE_STATUS_COLUMN}`=0 "
+            + f"ORDER BY `{SOURCE_ID_COLUMN}` ASC LIMIT %s"
         )
 
         with conn.cursor() as cur:
@@ -450,7 +427,7 @@ def main() -> int:
         LOGGER.info("Fetched pending rows: %d", len(rows))
 
         if not rows:
-            LOGGER.info("No pending rows found (status=0).")
+            LOGGER.info("No pending rows found (send_status=0).")
             conn.rollback()
             return 0
 
@@ -487,18 +464,13 @@ def main() -> int:
                 tenantname = wxid
                 insert_chatroom_row(
                     conn=conn,
-                    schema=cfg.target_schema,
-                    table=cfg.target_table,
                     wxid=wxid,
                     nick_name=nick_name,
+                    chatroom_type=cfg.chatroom_type,
                     tenantname=tenantname,
                 )
                 update_sms_status(
                     conn=conn,
-                    schema=cfg.source_schema,
-                    table=cfg.source_table,
-                    id_col=id_col,
-                    status_col=status_col,
                     row_id=row_id,
                     new_status=cfg.success_status,
                 )
@@ -515,10 +487,6 @@ def main() -> int:
                 LOGGER.exception("Failed processing row_id=%s: %s", row_id, exc)
                 update_sms_status(
                     conn=conn,
-                    schema=cfg.source_schema,
-                    table=cfg.source_table,
-                    id_col=id_col,
-                    status_col=status_col,
                     row_id=row_id,
                     new_status=cfg.error_status,
                 )
@@ -533,8 +501,8 @@ def main() -> int:
             success,
             skipped,
             failed,
-            status_col,
-            msg_col,
+            SOURCE_STATUS_COLUMN,
+            SOURCE_MESSAGE_COLUMN,
             sender_col,
         )
         return 0 if failed == 0 else 2
