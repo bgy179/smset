@@ -62,6 +62,15 @@ class AppConfig:
     interval_seconds: int
 
 
+@dataclass
+class SmsCommand:
+    """Parsed SMS command payload."""
+
+    kind: str
+    nick_name: str
+    ip_list: List[str]
+
+
 def setup_logging(level_name: str) -> None:
     """Configure global logging format and level.
 
@@ -119,16 +128,17 @@ def parse_sender_whitelist(raw: str) -> Set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
-def parse_sms_route_command(message: str) -> str | None:
-    """Parse command text and return nick_name for a valid _smsRoute command.
+def parse_sms_command(message: str) -> SmsCommand | None:
+    """Parse supported SMS commands.
 
-    Expected format:
+    Supported formats:
         _smsRoute <nick_name>
+        _smsRegister <nick_name> <ip_list>
     """
     if not message:
         return None
     text = message.strip()
-    if not text.startswith("_smsRoute "):
+    if not (text.startswith("_smsRoute ") or text.startswith("_smsRegister ")):
         return None
 
     try:
@@ -136,14 +146,34 @@ def parse_sms_route_command(message: str) -> str | None:
     except ValueError:
         return None
 
-    if len(parts) < 2 or parts[0] != "_smsRoute":
-        return None
+    command = parts[0]
+    if command == "_smsRoute":
+        if len(parts) != 2:
+            return None
+        nick_name = parts[1].strip()
+        if not nick_name:
+            return None
+        return SmsCommand(kind="route", nick_name=nick_name, ip_list=[])
 
-    nick_name = parts[1].strip()
-    if not nick_name:
-        return None
+    if command == "_smsRegister":
+        if len(parts) < 3:
+            return None
+        nick_name = parts[1].strip()
+        if not nick_name:
+            return None
 
-    return nick_name
+        ip_values: List[str] = []
+        for part in parts[2:]:
+            for item in part.split(","):
+                ip = item.strip()
+                if ip:
+                    ip_values.append(ip)
+
+        if not ip_values:
+            return None
+        return SmsCommand(kind="register", nick_name=nick_name, ip_list=ip_values)
+
+    return None
 
 
 def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
@@ -205,6 +235,44 @@ def lookup_chatroom_wxid(api_url: str, nick_name: str, timeout: float) -> str:
     if not wxid:
         raise RuntimeError(f"No wxid found for nick_name='{nick_name}'. API result: {result}")
     return wxid
+
+
+def lookup_chatroom_wxid_by_nickname(
+    conn: pymysql.connections.Connection,
+    nick_name: str,
+) -> str:
+    """Look up wxid from local wechat_chatroom table by nickname."""
+    sql = (
+        "SELECT wxid FROM `wzwmonitor`.`wechat_chatroom` "
+        "WHERE nickname=%s LIMIT 1"
+    )
+    with conn.cursor() as cur:
+        cur.execute(sql, (nick_name,))
+        row = cur.fetchone()
+    if not row or not isinstance(row.get("wxid"), str) or not row["wxid"].strip():
+        raise RuntimeError(f"No wxid found in wzwmonitor.wechat_chatroom for nick_name='{nick_name}'")
+    return row["wxid"].strip()
+
+
+def insert_tenant_ip_rows(
+    conn: pymysql.connections.Connection,
+    tenantname: str,
+    ip_list: List[str],
+) -> None:
+    """Insert one paas_cluster_tenantname_ip row for each IP using tenantname=wxid."""
+    sql = (
+        "INSERT INTO `wzwmonitor`.`paas_cluster_tenantname_ip` "
+        "(tenantname, ip) VALUES (%s, %s)"
+    )
+    with conn.cursor() as cur:
+        for ip in ip_list:
+            cur.execute(sql, (tenantname, ip))
+            LOGGER.info(
+                "Tenant IP insert succeeded. tenantname=%s ip=%s affected_rows=%d",
+                tenantname,
+                ip,
+                cur.rowcount,
+            )
 
 
 def insert_chatroom_row(
@@ -294,7 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build command-line parser for script runtime options."""
     p = argparse.ArgumentParser(
         description=(
-            "Read _smsRoute <nick_name> commands from decoded_sms, then sync to wechat_chatroom."
+            "Read _smsRoute/_smsRegister commands from decoded_sms and sync related tables."
         )
     )
     p.add_argument("--config", default="config.ini", help="Path to flat key=value config file")
@@ -420,39 +488,54 @@ def run_sync_cycle(cfg: AppConfig) -> int:
                 LOGGER.debug("Skip row_id=%s: sender not in whitelist", row_id)
                 continue
 
-            parsed = parse_sms_route_command(message)
-            if not parsed:
+            command = parse_sms_command(message)
+            if not command:
                 skipped += 1
-                LOGGER.debug("Skip row_id=%s: message is not a valid _smsRoute command", row_id)
+                LOGGER.debug("Skip row_id=%s: message is not a supported SMS command", row_id)
                 continue
 
-            nick_name = parsed
             try:
-                wxid = lookup_chatroom_wxid(
-                    api_url=cfg.api_url,
-                    nick_name=nick_name,
-                    timeout=cfg.http_timeout,
-                )
-                tenantname = wxid
-                insert_chatroom_row(
-                    conn=conn,
-                    wxid=wxid,
-                    nick_name=nick_name,
-                    tenantname=tenantname,
-                )
+                if command.kind == "route":
+                    wxid = lookup_chatroom_wxid(
+                        api_url=cfg.api_url,
+                        nick_name=command.nick_name,
+                        timeout=cfg.http_timeout,
+                    )
+                    tenantname = wxid
+                    insert_chatroom_row(
+                        conn=conn,
+                        wxid=wxid,
+                        nick_name=command.nick_name,
+                        tenantname=tenantname,
+                    )
+                    LOGGER.info(
+                        "Processed _smsRoute row_id=%s nick_name=%s wxid=%s tenantname=%s",
+                        row_id,
+                        command.nick_name,
+                        wxid,
+                        tenantname,
+                    )
+                else:
+                    wxid = lookup_chatroom_wxid_by_nickname(conn=conn, nick_name=command.nick_name)
+                    insert_tenant_ip_rows(
+                        conn=conn,
+                        tenantname=wxid,
+                        ip_list=command.ip_list,
+                    )
+                    LOGGER.info(
+                        "Processed _smsRegister row_id=%s nick_name=%s wxid=%s ip_count=%d",
+                        row_id,
+                        command.nick_name,
+                        wxid,
+                        len(command.ip_list),
+                    )
+
                 update_sms_status(
                     conn=conn,
                     row_id=row_id,
                     new_status=cfg.success_status,
                 )
                 success += 1
-                LOGGER.info(
-                    "Processed row_id=%s nick_name=%s wxid=%s tenantname=%s",
-                    row_id,
-                    nick_name,
-                    wxid,
-                    tenantname,
-                )
             except Exception as exc:  # pylint: disable=broad-except
                 failed += 1
                 LOGGER.exception("Failed processing row_id=%s: %s", row_id, exc)
@@ -501,7 +584,7 @@ def main() -> int:
     if cfg.allowed_senders:
         LOGGER.info("Sender whitelist enabled. count=%d", len(cfg.allowed_senders))
     else:
-        LOGGER.warning("Sender whitelist is empty. Any sender can trigger _smsRoute commands.")
+        LOGGER.warning("Sender whitelist is empty. Any sender can trigger SMS commands.")
 
     if args.run_once:
         return run_sync_cycle(cfg)
