@@ -33,16 +33,8 @@ except ImportError as exc:  # pragma: no cover
 
 LOGGER = logging.getLogger("sms_route_sync")
 
-SOURCE_ID_COLUMN = "id"
-SOURCE_MESSAGE_COLUMN = "message_content"
-SOURCE_STATUS_COLUMN = "send_status"
-SOURCE_SENDER_COLUMN = "sender"
-SOURCE_SCHEMA = "zbxalerts"
-SOURCE_TABLE = "decoded_sms"
-TARGET_SCHEMA = "wzwmonitor"
-TARGET_TABLE = "wechat_chatroom"
-WECHAT_DB_NAME = "MicroMsg.db"
 DEFAULT_ALLOWED_SENDERS = "8618710029810,8618612310179"
+DEFAULT_CHATROOM_TYPE = "【中国移动磐基PaaS平台】zabbix 监控"
 USED_CONFIG_KEYS = {
     "DB_HOST",
     "DB_PORT",
@@ -66,7 +58,6 @@ class AppConfig:
     http_timeout: float
     success_status: int
     error_status: int
-    chatroom_type: str
     allowed_senders: Set[str]
     interval_seconds: int
 
@@ -204,7 +195,7 @@ def lookup_chatroom_wxid(api_url: str, nick_name: str, timeout: float) -> str:
         f"WHERE Type=2 AND NickName='{safe_name}' "
         "LIMIT 1"
     )
-    result = http_exec_sql(api_url=api_url, db_name=WECHAT_DB_NAME, sql=sql, timeout=timeout)
+    result = http_exec_sql(api_url=api_url, db_name="MicroMsg.db", sql=sql, timeout=timeout)
     wxid = extract_wxid(result)
     if not wxid:
         raise RuntimeError(f"No wxid found for nick_name='{nick_name}'. API result: {result}")
@@ -215,7 +206,6 @@ def insert_chatroom_row(
     conn: pymysql.connections.Connection,
     wxid: str,
     nick_name: str,
-    chatroom_type: str,
     tenantname: str,
 ) -> None:
     """Insert or update one mapping row in wechat_chatroom.
@@ -224,7 +214,7 @@ def insert_chatroom_row(
     `tenantname`, so repeated commands should refresh the existing row instead of failing.
     """
     sql = (
-        f"INSERT INTO `{TARGET_SCHEMA}`.`{TARGET_TABLE}` "
+        "INSERT INTO `wzwmonitor`.`wechat_chatroom` "
         "(wxid, nickname, chatroom_type, tenantname) "
         "VALUES (%s, %s, %s, %s) "
         "ON DUPLICATE KEY UPDATE "
@@ -233,9 +223,52 @@ def insert_chatroom_row(
         "tenantname=VALUES(tenantname), "
         "update_time=CURRENT_TIMESTAMP"
     )
+    select_old_sql = (
+        "SELECT tenantname FROM `wzwmonitor`.`wechat_chatroom` WHERE wxid=%s LIMIT 1"
+    )
+    sync_tenant_sql = (
+        "UPDATE `wzwmonitor`.`paas_cluster_tenantname_ip` "
+        "SET tenantname=%s WHERE tenantname=%s"
+    )
 
     with conn.cursor() as cur:
-        cur.execute(sql, (wxid, nick_name, chatroom_type, tenantname))
+        old_tenantname = None
+        cur.execute(select_old_sql, (wxid,))
+        row = cur.fetchone()
+        if row and isinstance(row.get("tenantname"), str):
+            old_tenantname = row["tenantname"].strip()
+
+        params = (wxid, nick_name, DEFAULT_CHATROOM_TYPE, tenantname)
+        LOGGER.debug(
+            "Executing chatroom upsert. sql=%s params=%r",
+            sql,
+            params,
+        )
+        cur.execute(sql, params)
+        LOGGER.info(
+            "Chatroom upsert succeeded. wxid=%s nickname=%s tenantname=%s affected_rows=%d",
+            wxid,
+            nick_name,
+            tenantname,
+            cur.rowcount,
+        )
+
+        if old_tenantname and old_tenantname != tenantname:
+            cur.execute(sync_tenant_sql, (tenantname, old_tenantname))
+            LOGGER.info(
+                (
+                    "Tenantname changed in %s.%s for wxid=%s: old=%s new=%s; "
+                    "synced %s.%s affected_rows=%d"
+                ),
+                "wzwmonitor",
+                "wechat_chatroom",
+                wxid,
+                old_tenantname,
+                tenantname,
+                "wzwmonitor",
+                "paas_cluster_tenantname_ip",
+                cur.rowcount,
+            )
 
 
 def update_sms_status(
@@ -245,7 +278,7 @@ def update_sms_status(
 ) -> None:
     """Update one decoded_sms row status after processing."""
     sql = (
-        f"UPDATE `{SOURCE_SCHEMA}`.`{SOURCE_TABLE}` "
+        "UPDATE `zbxalerts`.`decoded_sms` "
         "SET `send_status`=%s WHERE `id`=%s"
     )
     with conn.cursor() as cur:
@@ -269,11 +302,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--http-timeout", type=float, default=5.0)
     p.add_argument("--success-status", type=int, default=1)
     p.add_argument("--error-status", type=int, default=-1)
-    p.add_argument(
-        "--chatroom-type",
-        default="sms_route",
-        help="Value written to wechat_chatroom.chatroom_type.",
-    )
     p.add_argument(
         "--allowed-senders",
         help="Comma-separated sender whitelist. Only these senders are treated as commands.",
@@ -327,7 +355,6 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         http_timeout=args.http_timeout,
         success_status=args.success_status,
         error_status=args.error_status,
-        chatroom_type=args.chatroom_type,
         allowed_senders=allowed_senders,
         interval_seconds=interval_seconds,
     )
@@ -340,7 +367,7 @@ def run_sync_cycle(cfg: AppConfig) -> int:
         port=cfg.db_port,
         user=cfg.db_user,
         password=cfg.db_password,
-        database=SOURCE_SCHEMA,
+        database="zbxalerts",
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
@@ -349,19 +376,17 @@ def run_sync_cycle(cfg: AppConfig) -> int:
     try:
         LOGGER.info(
             "Resolved columns. id=%s message=%s status=%s sender=%s",
-            SOURCE_ID_COLUMN,
-            SOURCE_MESSAGE_COLUMN,
-            SOURCE_STATUS_COLUMN,
-            SOURCE_SENDER_COLUMN,
+            "id",
+            "message_content",
+            "send_status",
+            "sender",
         )
 
         select_sql = (
-            f"SELECT `{SOURCE_ID_COLUMN}` AS row_id, "
-            f"`{SOURCE_MESSAGE_COLUMN}` AS message, "
-            f"`{SOURCE_SENDER_COLUMN}` AS sender "
-            + f" FROM `{SOURCE_SCHEMA}`.`{SOURCE_TABLE}` "
-            + f"WHERE `{SOURCE_STATUS_COLUMN}`=0 "
-            + f"ORDER BY `{SOURCE_ID_COLUMN}` ASC LIMIT %s"
+            "SELECT `id` AS row_id, `message_content` AS message, `sender` AS sender "
+            "FROM `zbxalerts`.`decoded_sms` "
+            "WHERE `send_status`=0 "
+            "ORDER BY `id` ASC LIMIT %s"
         )
 
         with conn.cursor() as cur:
@@ -408,7 +433,6 @@ def run_sync_cycle(cfg: AppConfig) -> int:
                     conn=conn,
                     wxid=wxid,
                     nick_name=nick_name,
-                    chatroom_type=cfg.chatroom_type,
                     tenantname=tenantname,
                 )
                 update_sms_status(
@@ -443,9 +467,9 @@ def run_sync_cycle(cfg: AppConfig) -> int:
             success,
             skipped,
             failed,
-            SOURCE_STATUS_COLUMN,
-            SOURCE_MESSAGE_COLUMN,
-            SOURCE_SENDER_COLUMN,
+            "send_status",
+            "message_content",
+            "sender",
         )
         return 0 if failed == 0 else 2
     finally:
@@ -462,10 +486,10 @@ def main() -> int:
 
     LOGGER.info(
         "Starting sync service. source=%s.%s target=%s.%s batch_size=%d interval=%ds",
-        SOURCE_SCHEMA,
-        SOURCE_TABLE,
-        TARGET_SCHEMA,
-        TARGET_TABLE,
+        "zbxalerts",
+        "decoded_sms",
+        "wzwmonitor",
+        "wechat_chatroom",
         cfg.batch_size,
         cfg.interval_seconds,
     )
