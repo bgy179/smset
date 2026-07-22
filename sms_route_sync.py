@@ -102,6 +102,7 @@ def parse_flat_ini(path: str) -> Dict[str, str]:
     except FileNotFoundError:
         LOGGER.debug("Config file not found: %s", path)
         return values
+         
     return values
 
 
@@ -149,7 +150,9 @@ def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
     """Call local execSql HTTP API and return parsed JSON result."""
     LOGGER.debug("Calling execSql API. url=%s db=%s timeout=%.2fs", api_url, db_name, timeout)
     payload = {"dbName": db_name, "sql": sql}
+    # Send UTF-8 JSON body and declare charset explicitly.
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+ 
     req = urllib.request.Request(
         api_url,
         data=data,
@@ -188,11 +191,13 @@ def extract_wxid(api_result: Any) -> str | None:
 
 def lookup_chatroom_wxid(api_url: str, nick_name: str, timeout: float) -> str:
     """Query WeChat DB through execSql API and resolve chatroom wxid by nickname."""
-    safe_name = quote_sql(nick_name)
+    # Use hex(NickName) matching to avoid any server-side Unicode decoding issues
+    # when the SQL string contains Chinese characters.
+    nickname_hex = nick_name.encode("utf-8").hex().upper()
     sql = (
         "SELECT UserName AS wxid, NickName "
         "FROM Contact "
-        f"WHERE Type=2 AND NickName='{safe_name}' "
+        f"WHERE Type=2 AND hex(NickName)='{nickname_hex}' "
         "LIMIT 1"
     )
     result = http_exec_sql(api_url=api_url, db_name="MicroMsg.db", sql=sql, timeout=timeout)
