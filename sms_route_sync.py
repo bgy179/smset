@@ -8,6 +8,7 @@ Flow:
 3. Query wxid from local HTTP API: http://127.0.0.1:8080/api/execSql
 4. Insert into wzwmonitor.wechat_chatroom(wxid, nickname, chatroom_type, tenantname=wxid)
 5. Mark source row as processed.
+6. Loop forever and run one sync cycle every 60 seconds.
 """
 
 from __future__ import annotations
@@ -16,11 +17,11 @@ import argparse
 import json
 import logging
 import shlex
-import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 try:
     import pymysql
@@ -59,6 +60,7 @@ class AppConfig:
     chatroom_type: str
     sender_column: Optional[str]
     allowed_senders: Set[str]
+    interval_seconds: int
 
 
 def setup_logging(level_name: str) -> None:
@@ -105,42 +107,6 @@ def quote_sql(value: str) -> str:
     """Escape a Python string for use inside a single-quoted SQL literal."""
     # Minimal SQL string escaping for single-quoted literals.
     return value.replace("\\", "\\\\").replace("'", "''")
-
-
-def find_first_existing_column(
-    conn: pymysql.connections.Connection,
-    schema: str,
-    table: str,
-    candidates: Sequence[str],
-) -> Optional[str]:
-    """Return the first matching column that exists in the target table.
-
-    Args:
-        conn: MySQL connection.
-        schema: Table schema.
-        table: Table name.
-        candidates: Column names in priority order.
-
-    Returns:
-        First existing column name, or None when none exist.
-    """
-    placeholders = ",".join(["%s"] * len(candidates))
-    sql = (
-        "SELECT column_name "
-        "FROM information_schema.columns "
-        "WHERE table_schema=%s AND table_name=%s AND column_name IN ("
-        + placeholders
-        + ")"
-    )
-    with conn.cursor() as cur:
-        cur.execute(sql, [schema, table, *candidates])
-        found = {row["column_name"] for row in cur.fetchall()}
-    for c in candidates:
-        if c in found:
-            LOGGER.debug("Resolved column %s.%s -> %s", schema, table, c)
-            return c
-    LOGGER.debug("No matching columns found on %s.%s from %s", schema, table, candidates)
-    return None
 
 
 def parse_sender_whitelist(raw: str) -> Set[str]:
@@ -320,6 +286,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Logging verbosity level.",
     )
+    p.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=60,
+        help="Service loop interval in seconds.",
+    )
+    p.add_argument(
+        "--run-once",
+        action="store_true",
+        help="Run only one sync cycle and exit.",
+    )
     return p
 
 
@@ -334,6 +311,9 @@ def load_config(args: argparse.Namespace) -> AppConfig:
     allowed_senders = parse_sender_whitelist(
         args.allowed_senders or cfg.get("ALLOWED_SENDERS", "")
     )
+    interval_seconds = args.interval_seconds or int(cfg.get("INTERVAL_SECONDS", "60"))
+    if interval_seconds <= 0:
+        interval_seconds = 60
     LOGGER.debug(
         "Config loaded. source=%s.%s target=%s.%s whitelist_size=%d",
         args.source_schema,
@@ -361,29 +341,12 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         chatroom_type=args.chatroom_type,
         sender_column=sender_column,
         allowed_senders=allowed_senders,
+        interval_seconds=interval_seconds,
     )
 
 
-def main() -> int:
-    """Run one batch of SMS command synchronization."""
-    parser = build_parser()
-    args = parser.parse_args()
-    setup_logging(args.log_level)
-    cfg = load_config(args)
-
-    LOGGER.info(
-        "Starting sync. source=%s.%s target=%s.%s batch_size=%d",
-        cfg.source_schema,
-        cfg.source_table,
-        cfg.target_schema,
-        cfg.target_table,
-        cfg.batch_size,
-    )
-    if cfg.allowed_senders:
-        LOGGER.info("Sender whitelist enabled. count=%d", len(cfg.allowed_senders))
-    else:
-        LOGGER.warning("Sender whitelist is empty. Any sender can trigger _smsRoute commands.")
-
+def run_sync_cycle(cfg: AppConfig) -> int:
+    """Run one sync cycle and process current pending rows."""
     conn = pymysql.connect(
         host=cfg.db_host,
         port=cfg.db_port,
@@ -509,6 +472,49 @@ def main() -> int:
     finally:
         LOGGER.debug("Closing DB connection")
         conn.close()
+
+
+def main() -> int:
+    """Run as a long-running service and execute one cycle per interval."""
+    parser = build_parser()
+    args = parser.parse_args()
+    setup_logging(args.log_level)
+    cfg = load_config(args)
+
+    LOGGER.info(
+        "Starting sync service. source=%s.%s target=%s.%s batch_size=%d interval=%ds",
+        cfg.source_schema,
+        cfg.source_table,
+        cfg.target_schema,
+        cfg.target_table,
+        cfg.batch_size,
+        cfg.interval_seconds,
+    )
+    if cfg.allowed_senders:
+        LOGGER.info("Sender whitelist enabled. count=%d", len(cfg.allowed_senders))
+    else:
+        LOGGER.warning("Sender whitelist is empty. Any sender can trigger _smsRoute commands.")
+
+    if args.run_once:
+        return run_sync_cycle(cfg)
+
+    try:
+        while True:
+            cycle_started_at = time.time()
+            try:
+                code = run_sync_cycle(cfg)
+                if code != 0:
+                    LOGGER.warning("Sync cycle completed with non-zero code=%d", code)
+            except Exception as exc:  # pylint: disable=broad-except
+                LOGGER.exception("Sync cycle crashed: %s", exc)
+
+            elapsed = time.time() - cycle_started_at
+            wait_seconds = max(0.0, float(cfg.interval_seconds) - elapsed)
+            LOGGER.info("Sleeping %.1f seconds before next cycle", wait_seconds)
+            time.sleep(wait_seconds)
+    except KeyboardInterrupt:
+        LOGGER.info("Service stopped by user")
+        return 0
 
 
 if __name__ == "__main__":
