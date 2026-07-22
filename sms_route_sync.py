@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shlex
 import time
 import urllib.error
@@ -95,6 +96,7 @@ def parse_flat_ini(path: str) -> Dict[str, str]:
         Dict of parsed key/value pairs. Returns empty dict when file does not exist.
     """
     values: Dict[str, str] = {}
+    LOGGER.debug("Loading config file: path=%s", path)
     try:
         with open(path, "r", encoding="utf-8") as f:
             for raw in f:
@@ -111,7 +113,8 @@ def parse_flat_ini(path: str) -> Dict[str, str]:
     except FileNotFoundError:
         LOGGER.debug("Config file not found: %s", path)
         return values
-         
+
+    LOGGER.info("Config file loaded: path=%s keys=%s", path, sorted(values.keys()))
     return values
 
 
@@ -124,8 +127,11 @@ def quote_sql(value: str) -> str:
 def parse_sender_whitelist(raw: str) -> Set[str]:
     """Parse comma-separated sender whitelist into a normalized set."""
     if not raw:
+        LOGGER.debug("Sender whitelist input is empty")
         return set()
-    return {item.strip() for item in raw.split(",") if item.strip()}
+    senders = {item.strip() for item in raw.split(",") if item.strip()}
+    LOGGER.debug("Parsed sender whitelist: count=%d values=%s", len(senders), sorted(senders))
+    return senders
 
 
 def parse_sms_command(message: str) -> SmsCommand | None:
@@ -136,49 +142,68 @@ def parse_sms_command(message: str) -> SmsCommand | None:
         _smsRegister <nick_name> <ip_list>
     """
     if not message:
+        LOGGER.debug("SMS command parse skipped: empty message")
         return None
     text = message.strip()
     if not (text.startswith("_smsRoute ") or text.startswith("_smsRegister ")):
+        LOGGER.debug("SMS command parse skipped: unsupported prefix message=%r", message)
         return None
 
     try:
         parts = shlex.split(text)
-    except ValueError:
+    except ValueError as exc:
+        LOGGER.warning("SMS command parse failed: shlex error message=%r error=%s", message, exc)
         return None
+
+    LOGGER.debug("SMS command tokenized: parts=%r", parts)
 
     command = parts[0]
     if command == "_smsRoute":
         if len(parts) != 2:
+            LOGGER.warning("_smsRoute parse failed: expected 2 parts actual=%d message=%r", len(parts), message)
             return None
         nick_name = parts[1].strip()
         if not nick_name:
+            LOGGER.warning("_smsRoute parse failed: empty nick_name message=%r", message)
             return None
+        LOGGER.info("Parsed SMS command: kind=route nick_name=%s", nick_name)
         return SmsCommand(kind="route", nick_name=nick_name, ip_list=[])
 
     if command == "_smsRegister":
         if len(parts) < 3:
+            LOGGER.warning("_smsRegister parse failed: insufficient parts actual=%d message=%r", len(parts), message)
             return None
         nick_name = parts[1].strip()
         if not nick_name:
+            LOGGER.warning("_smsRegister parse failed: empty nick_name message=%r", message)
             return None
 
         ip_values: List[str] = []
         for part in parts[2:]:
-            for item in part.split(","):
+            for item in re.split(r"[;,\s]+", part):
                 ip = item.strip()
                 if ip:
                     ip_values.append(ip)
 
         if not ip_values:
+            LOGGER.warning("_smsRegister parse failed: empty ip list message=%r", message)
             return None
+        LOGGER.info(
+            "Parsed SMS command: kind=register nick_name=%s ip_count=%d ips=%s",
+            nick_name,
+            len(ip_values),
+            ip_values,
+        )
         return SmsCommand(kind="register", nick_name=nick_name, ip_list=ip_values)
 
+    LOGGER.debug("SMS command parse ended with unsupported command=%s", command)
     return None
 
 
 def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
     """Call local execSql HTTP API and return parsed JSON result."""
-    LOGGER.debug("Calling execSql API. url=%s db=%s timeout=%.2fs", api_url, db_name, timeout)
+    LOGGER.info("Calling execSql API: url=%s db=%s timeout=%.2fs", api_url, db_name, timeout)
+    LOGGER.debug("execSql request SQL: %s", sql)
     payload = {"dbName": db_name, "sql": sql}
     # Send UTF-8 JSON body and declare charset explicitly.
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -190,16 +215,21 @@ def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        LOGGER.debug("execSql HTTP response status=%s", getattr(resp, "status", "unknown"))
         body = resp.read().decode("utf-8", errors="replace")
+    LOGGER.debug("execSql raw response body=%s", body)
     try:
-        return json.loads(body)
+        parsed = json.loads(body)
+        LOGGER.info("execSql API call finished successfully")
+        return parsed
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"execSql returned non-JSON response: {body[:300]}") from exc
 
 
 def http_post_json(url: str, payload: Dict[str, Any], timeout: float) -> Any:
     """POST JSON to a local HTTP API and return parsed JSON when possible."""
-    LOGGER.debug("Calling JSON API. url=%s timeout=%.2fs payload=%s", url, timeout, payload)
+    LOGGER.info("Calling JSON API: url=%s timeout=%.2fs", url, timeout)
+    LOGGER.debug("JSON API request payload=%s", payload)
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -208,12 +238,18 @@ def http_post_json(url: str, payload: Dict[str, Any], timeout: float) -> Any:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        LOGGER.debug("JSON API response status=%s", getattr(resp, "status", "unknown"))
         body = resp.read().decode("utf-8", errors="replace")
+    LOGGER.debug("JSON API raw response body=%s", body)
     if not body:
+        LOGGER.info("JSON API returned empty body")
         return None
     try:
-        return json.loads(body)
+        parsed = json.loads(body)
+        LOGGER.info("JSON API call finished successfully")
+        return parsed
     except json.JSONDecodeError:
+        LOGGER.info("JSON API returned non-JSON body")
         return body
 
 
@@ -221,21 +257,29 @@ def build_sendtxtmsg_url(api_url: str) -> str:
     """Build sendtxtmsg endpoint from execSql endpoint."""
     marker = "/api/execSql"
     if api_url.endswith(marker):
-        return api_url[: -len(marker)] + "/api/sendtxtmsg"
-    return api_url.rstrip("/") + "/api/sendtxtmsg"
+        send_url = api_url[: -len(marker)] + "/api/sendtxtmsg"
+        LOGGER.debug("Derived sendtxtmsg URL from execSql URL: %s", send_url)
+        return send_url
+    send_url = api_url.rstrip("/") + "/api/sendtxtmsg"
+    LOGGER.debug("Derived sendtxtmsg URL by suffix append: %s", send_url)
+    return send_url
 
 
 def extract_wxid(api_result: Any) -> str | None:
     """Extract wxid from execSql fixed response: {code, msg, data:[{wxid,...}]}"""
     if not isinstance(api_result, dict):
+        LOGGER.warning("extract_wxid failed: api_result is not dict actual_type=%s", type(api_result).__name__)
         return None
     if api_result.get("code") != 200:
+        LOGGER.warning("extract_wxid failed: code=%r response=%r", api_result.get("code"), api_result)
         return None
     if api_result.get("msg") != "success":
+        LOGGER.warning("extract_wxid failed: msg=%r response=%r", api_result.get("msg"), api_result)
         return None
 
     data = api_result.get("data")
     if not isinstance(data, list):
+        LOGGER.warning("extract_wxid failed: data is not list response=%r", api_result)
         return None
 
     for item in data:
@@ -243,7 +287,9 @@ def extract_wxid(api_result: Any) -> str | None:
             continue
         wxid = item.get("wxid")
         if isinstance(wxid, str) and wxid.strip():
+            LOGGER.info("extract_wxid succeeded: wxid=%s", wxid.strip())
             return wxid.strip()
+    LOGGER.warning("extract_wxid failed: no valid wxid found response=%r", api_result)
     return None
 
 
@@ -252,6 +298,7 @@ def lookup_chatroom_wxid(api_url: str, nick_name: str, timeout: float) -> str:
     # Use hex(NickName) matching to avoid any server-side Unicode decoding issues
     # when the SQL string contains Chinese characters.
     nickname_hex = nick_name.encode("utf-8").hex().upper()
+    LOGGER.info("Looking up chatroom wxid via execSql: nick_name=%s nickname_hex=%s", nick_name, nickname_hex)
     sql = (
         "SELECT UserName AS wxid, NickName "
         "FROM Contact "
@@ -262,6 +309,7 @@ def lookup_chatroom_wxid(api_url: str, nick_name: str, timeout: float) -> str:
     wxid = extract_wxid(result)
     if not wxid:
         raise RuntimeError(f"No wxid found for nick_name='{nick_name}'. API result: {result}")
+    LOGGER.info("Chatroom wxid lookup succeeded via execSql: nick_name=%s wxid=%s", nick_name, wxid)
     return wxid
 
 
@@ -274,11 +322,13 @@ def lookup_chatroom_wxid_by_nickname(
         "SELECT wxid FROM `wzwmonitor`.`wechat_chatroom` "
         "WHERE nickname=%s LIMIT 1"
     )
+    LOGGER.info("Looking up local chatroom wxid: nick_name=%s", nick_name)
     with conn.cursor() as cur:
         cur.execute(sql, (nick_name,))
         row = cur.fetchone()
     if not row or not isinstance(row.get("wxid"), str) or not row["wxid"].strip():
         raise RuntimeError(f"No wxid found in wzwmonitor.wechat_chatroom for nick_name='{nick_name}'")
+    LOGGER.info("Local chatroom wxid lookup succeeded: nick_name=%s wxid=%s", nick_name, row["wxid"].strip())
     return row["wxid"].strip()
 
 
@@ -293,8 +343,10 @@ def insert_tenant_ip_rows(
         "(tenantname, ip) VALUES (%s, %s)"
     )
     inserted_ips: List[str] = []
+    LOGGER.info("Starting tenant IP inserts: tenantname=%s ip_count=%d", tenantname, len(ip_list))
     with conn.cursor() as cur:
         for ip in ip_list:
+            LOGGER.debug("Executing tenant IP insert: tenantname=%s ip=%s", tenantname, ip)
             cur.execute(sql, (tenantname, ip))
             inserted_ips.append(ip)
             LOGGER.info(
@@ -303,6 +355,7 @@ def insert_tenant_ip_rows(
                 ip,
                 cur.rowcount,
             )
+    LOGGER.info("Completed tenant IP inserts: tenantname=%s inserted_ips=%s", tenantname, inserted_ips)
     return inserted_ips
 
 
@@ -320,6 +373,13 @@ def send_register_result_message(
     sendtxtmsg_url = build_sendtxtmsg_url(api_url)
     message = "_smsRegister succeeded. inserted IPs: " + ", ".join(inserted_ips)
     payload = {"wxid": wxid, "content": message}
+    LOGGER.info(
+        "Sending register result message: nick_name=%s wxid=%s ip_count=%d url=%s",
+        nick_name,
+        wxid,
+        len(inserted_ips),
+        sendtxtmsg_url,
+    )
     result = http_post_json(sendtxtmsg_url, payload, timeout)
     LOGGER.info(
         "sendtxtmsg succeeded. nick_name=%s wxid=%s ip_count=%d response=%r",
@@ -359,12 +419,14 @@ def insert_chatroom_row(
         "SET tenantname=%s WHERE tenantname=%s"
     )
 
+    LOGGER.info("Starting chatroom upsert: wxid=%s nick_name=%s tenantname=%s", wxid, nick_name, tenantname)
     with conn.cursor() as cur:
         old_tenantname = None
         cur.execute(select_old_sql, (wxid,))
         row = cur.fetchone()
         if row and isinstance(row.get("tenantname"), str):
             old_tenantname = row["tenantname"].strip()
+        LOGGER.debug("Existing tenantname lookup: wxid=%s old_tenantname=%s", wxid, old_tenantname)
 
         params = (wxid, nick_name, DEFAULT_CHATROOM_TYPE, tenantname)
         LOGGER.debug(
@@ -409,8 +471,10 @@ def update_sms_status(
         "UPDATE `zbxalerts`.`decoded_sms` "
         "SET `send_status`=%s WHERE `id`=%s"
     )
+    LOGGER.info("Updating SMS status: row_id=%s new_status=%s", row_id, new_status)
     with conn.cursor() as cur:
         cur.execute(sql, (new_status, row_id))
+        LOGGER.debug("SMS status update affected_rows=%d row_id=%s", cur.rowcount, row_id)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -469,8 +533,15 @@ def load_config(args: argparse.Namespace) -> AppConfig:
     if interval_seconds <= 0:
         interval_seconds = 60
     LOGGER.debug(
-        "Config loaded. whitelist_size=%d",
+        "Config loaded. whitelist_size=%d db_host=%s db_port=%d api_url=%s batch_size=%d interval_seconds=%d success_status=%d error_status=%d",
         len(allowed_senders),
+        db_host,
+        db_port,
+        args.api_url,
+        args.batch_size,
+        interval_seconds,
+        args.success_status,
+        args.error_status,
     )
 
     return AppConfig(
@@ -490,6 +561,13 @@ def load_config(args: argparse.Namespace) -> AppConfig:
 
 def run_sync_cycle(cfg: AppConfig) -> int:
     """Run one sync cycle and process current pending rows."""
+    LOGGER.info(
+        "Opening DB connection for sync cycle: host=%s port=%d user=%s batch_size=%d",
+        cfg.db_host,
+        cfg.db_port,
+        cfg.db_user,
+        cfg.batch_size,
+    )
     conn = pymysql.connect(
         host=cfg.db_host,
         port=cfg.db_port,
@@ -502,6 +580,7 @@ def run_sync_cycle(cfg: AppConfig) -> int:
     )
 
     try:
+        LOGGER.info("Sync cycle started")
         LOGGER.info(
             "Resolved columns. id=%s message=%s status=%s sender=%s",
             "id",
@@ -518,6 +597,7 @@ def run_sync_cycle(cfg: AppConfig) -> int:
         )
 
         with conn.cursor() as cur:
+            LOGGER.debug("Executing pending SMS select: batch_size=%d", cfg.batch_size)
             cur.execute(select_sql, (cfg.batch_size,))
             rows: List[Dict[str, Any]] = list(cur.fetchall())
         LOGGER.info("Fetched pending rows: %d", len(rows))
@@ -535,22 +615,32 @@ def run_sync_cycle(cfg: AppConfig) -> int:
             row_id = int(row["row_id"])
             message = str(row.get("message") or "")
             sender = str(row.get("sender") or "").strip()
-            LOGGER.debug("Processing row_id=%s sender=%s message=%r", row_id, sender, message)
+            LOGGER.info("Processing row: row_id=%s sender=%s message=%r", row_id, sender, message)
 
             # A command must come from a sender in the whitelist (when configured).
             if cfg.allowed_senders and sender not in cfg.allowed_senders:
                 skipped += 1
-                LOGGER.debug("Skip row_id=%s: sender not in whitelist", row_id)
+                LOGGER.info(
+                    "Skip row_id=%s: sender=%s not in whitelist=%s",
+                    row_id,
+                    sender,
+                    sorted(cfg.allowed_senders),
+                )
                 continue
 
             command = parse_sms_command(message)
             if not command:
                 skipped += 1
-                LOGGER.debug("Skip row_id=%s: message is not a supported SMS command", row_id)
+                LOGGER.info(
+                    "Skip row_id=%s: unsupported command format message=%r",
+                    row_id,
+                    message,
+                )
                 continue
 
             try:
                 if command.kind == "route":
+                    LOGGER.info("Executing route command: row_id=%s nick_name=%s", row_id, command.nick_name)
                     wxid = lookup_chatroom_wxid(
                         api_url=cfg.api_url,
                         nick_name=command.nick_name,
@@ -571,6 +661,12 @@ def run_sync_cycle(cfg: AppConfig) -> int:
                         tenantname,
                     )
                 else:
+                    LOGGER.info(
+                        "Executing register command: row_id=%s nick_name=%s ip_count=%d",
+                        row_id,
+                        command.nick_name,
+                        len(command.ip_list),
+                    )
                     wxid = lookup_chatroom_wxid_by_nickname(conn=conn, nick_name=command.nick_name)
                     inserted_ips = insert_tenant_ip_rows(
                         conn=conn,
@@ -607,6 +703,7 @@ def run_sync_cycle(cfg: AppConfig) -> int:
                     new_status=cfg.error_status,
                 )
 
+        LOGGER.info("Committing sync cycle transaction")
         conn.commit()
         LOGGER.info(
             (
@@ -623,7 +720,7 @@ def run_sync_cycle(cfg: AppConfig) -> int:
         )
         return 0 if failed == 0 else 2
     finally:
-        LOGGER.debug("Closing DB connection")
+        LOGGER.info("Closing DB connection for sync cycle")
         conn.close()
 
 
@@ -632,6 +729,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     setup_logging(args.log_level)
+    LOGGER.info("Program started with args=%s", vars(args))
     cfg = load_config(args)
 
     LOGGER.info(
@@ -644,16 +742,22 @@ def main() -> int:
         cfg.interval_seconds,
     )
     if cfg.allowed_senders:
-        LOGGER.info("Sender whitelist enabled. count=%d", len(cfg.allowed_senders))
+        LOGGER.info(
+            "Sender whitelist enabled. count=%d values=%s",
+            len(cfg.allowed_senders),
+            sorted(cfg.allowed_senders),
+        )
     else:
         LOGGER.warning("Sender whitelist is empty. Any sender can trigger SMS commands.")
 
     if args.run_once:
+        LOGGER.info("Run-once mode enabled")
         return run_sync_cycle(cfg)
 
     try:
         while True:
             cycle_started_at = time.time()
+            LOGGER.info("Service loop iteration started")
             try:
                 code = run_sync_cycle(cfg)
                 if code != 0:
@@ -662,6 +766,7 @@ def main() -> int:
                 LOGGER.exception("Sync cycle crashed: %s", exc)
 
             elapsed = time.time() - cycle_started_at
+            LOGGER.info("Service loop iteration finished: elapsed=%.3fs", elapsed)
             wait_seconds = max(0.0, float(cfg.interval_seconds) - elapsed)
             LOGGER.info("Sleeping %.1f seconds before next cycle", wait_seconds)
             time.sleep(wait_seconds)
