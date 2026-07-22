@@ -23,6 +23,9 @@
 #define SERVICE_NAME_A     "SmsWechatRouterGateway"
 #define SERVICE_DISPLAY    "短信接收及动态路由微信网关服务"
 #define SERVICE_DESC       "采集Air780短信，根据IP内存路由表分发至多个微信群，含断线重试补偿"
+#define SERVICE_NAME_W     L"SmsWechatRouterGateway"
+#define SERVICE_DISPLAY_W  L"短信接收及动态路由微信网关服务"
+#define SERVICE_DESC_W     L"采集Air780短信，根据IP内存路由表分发至多个微信群，含断线重试补偿"
 #define BAUD_RATE          CBR_115200
 #define DB_PORT         3306
 
@@ -1500,10 +1503,39 @@ BOOL TablesAndMysqlInit() {
 
 // ===================== 主循环实时双向捕获模型 =====================
 void ServiceWorkLoop() {
-    if (!AutoDetectComPort() || (hSerial = OpenSingleCom(g_ValidComPort, BAUD_RATE)) == INVALID_HANDLE_VALUE || !TablesAndMysqlInit()) {
-        WriteLog("[服务核心] [致命] 硬件链路启动中断：由于串口被篡改冲突或数据库配置错误");
-        return;
+    for (;;) {
+        bool init_ok = true;
+
+        if (!AutoDetectComPort()) {
+            WriteLog("[服务核心] [启动重试] 未找到可用Air780串口，5秒后重试");
+            init_ok = false;
+        } else if ((hSerial = OpenSingleCom(g_ValidComPort, BAUD_RATE)) == INVALID_HANDLE_VALUE) {
+            WriteLog("[服务核心] [启动重试] 串口打开失败，5秒后重试");
+            init_ok = false;
+        } else if (!TablesAndMysqlInit()) {
+            WriteLog("[服务核心] [启动重试] 数据库初始化失败，5秒后重试");
+            init_ok = false;
+        }
+
+        if (init_ok) {
+            break;
+        }
+
+        CloseCurrentSerial();
+        if (mysql) {
+            mysql_close(mysql);
+            mysql = NULL;
+        }
+
+        if (!g_bDebugMode) {
+            if (WaitForSingleObject(g_hStopEvent, 5000) == WAIT_OBJECT_0) {
+                return;
+            }
+        } else {
+            Sleep(5000);
+        }
     }
+
     WriteLog("[服务核心] 通信总线已打通。准备对Air780配置高频主动上报机制参数...");
     
     char buf[32] = {0};
@@ -1701,16 +1733,62 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv) {
 
 int main(int argc, char* argv[]) {
     if (argc >= 2) {
-        char binPath[1024]; GetModuleFileNameA(NULL, binPath, sizeof(binPath));
-        SC_HANDLE hSCM = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+        WCHAR binPath[MAX_PATH];
+        GetModuleFileNameW(NULL, binPath, _countof(binPath));
+        SC_HANDLE hSCM = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+        if (!hSCM) {
+            printf("打开SCM失败，错误码=%lu\n", (unsigned long)GetLastError());
+            return 1;
+        }
+
         if (_stricmp(argv[1], "install") == 0) {
-            SC_HANDLE hS = CreateServiceA(hSCM, SERVICE_NAME_A, SERVICE_DISPLAY, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, binPath, NULL, NULL, NULL, NULL, NULL);
-            if (hS) { SERVICE_DESCRIPTIONA desc = { SERVICE_DESC }; ChangeServiceConfig2A(hS, SERVICE_CONFIG_DESCRIPTION, &desc); CloseServiceHandle(hS); }
-            CloseServiceHandle(hSCM); printf("服务安装成功！\n"); return 0;
+            SC_HANDLE hS = CreateServiceW(
+                hSCM,
+                SERVICE_NAME_W,
+                SERVICE_DISPLAY_W,
+                SERVICE_ALL_ACCESS,
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START,
+                SERVICE_ERROR_NORMAL,
+                binPath,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL
+            );
+
+            if (!hS && GetLastError() == ERROR_SERVICE_EXISTS) {
+                hS = OpenServiceW(hSCM, SERVICE_NAME_W, SERVICE_ALL_ACCESS);
+            }
+
+            if (hS) {
+                SERVICE_DESCRIPTIONW desc = { SERVICE_DESC_W };
+                ChangeServiceConfig2W(hS, SERVICE_CONFIG_DESCRIPTION, &desc);
+                CloseServiceHandle(hS);
+                CloseServiceHandle(hSCM);
+                printf("服务安装成功！\n");
+                return 0;
+            }
+
+            printf("服务安装失败，错误码=%lu\n", (unsigned long)GetLastError());
+            CloseServiceHandle(hSCM);
+            return 1;
         } else if (_stricmp(argv[1], "uninstall") == 0) {
-            SC_HANDLE hS = OpenServiceA(hSCM, SERVICE_NAME_A, SERVICE_ALL_ACCESS);
-            if (hS) { SERVICE_STATUS status; ControlService(hS, SERVICE_CONTROL_STOP, &status); DeleteService(hS); CloseServiceHandle(hS); }
-            CloseServiceHandle(hSCM); printf("服务卸载成功！\n"); return 0;
+            SC_HANDLE hS = OpenServiceW(hSCM, SERVICE_NAME_W, SERVICE_ALL_ACCESS);
+            if (hS) {
+                SERVICE_STATUS status;
+                ControlService(hS, SERVICE_CONTROL_STOP, &status);
+                DeleteService(hS);
+                CloseServiceHandle(hS);
+                CloseServiceHandle(hSCM);
+                printf("服务卸载成功！\n");
+                return 0;
+            }
+
+            printf("服务卸载失败，错误码=%lu\n", (unsigned long)GetLastError());
+            CloseServiceHandle(hSCM);
+            return 1;
         } 
         else if (_stricmp(argv[1], "debug") == 0) {
             g_bDebugMode = true;
@@ -1724,6 +1802,8 @@ int main(int argc, char* argv[]) {
             curl_global_cleanup(); if (log_fp) fclose(log_fp);
             return 0;
         }
+
+        CloseServiceHandle(hSCM);
     }
     
     SERVICE_TABLE_ENTRY ServiceTable[] = { { SERVICE_NAME_A, ServiceMain }, { NULL, NULL } };
