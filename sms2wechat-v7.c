@@ -661,7 +661,7 @@ DWORD WINAPI CacheRefreshThreadProc(LPVOID lpParam) {
 
 // ===================== 从短信文本中提取 IP =====================
 static int extract_tenantip_from_message(const char *msg, char *out_ip, size_t out_len) {
-    static const char *pattern = "<IP>([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3})<IP>";
+    static const char *pattern = "<IP>\\| ([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3})<IP>";
     regex_t re; 
     regmatch_t match[2]; 
     int ret = -1;
@@ -1091,7 +1091,7 @@ HANDLE OpenSingleCom(LPCWSTR portName, DWORD baud) {
     HANDLE h = CreateFileW(portName, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
     
-    SetupComm(h, 1024 * 1024, 1024 * 1024); 
+    SetupComm(h, 64 * 1024, 64 * 1024); 
 
     DCB dcb = {0}; 
     dcb.DCBlength = sizeof(DCB); 
