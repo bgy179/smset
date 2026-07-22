@@ -340,17 +340,18 @@ def insert_tenant_ip_rows(
     """Insert one paas_cluster_tenantname_ip row for each IP using tenantname=wxid."""
     sql = (
         "INSERT INTO `wzwmonitor`.`paas_cluster_tenantname_ip` "
-        "(tenantname, ip) VALUES (%s, %s)"
+        "(tenantname, clustername, tenantip) VALUES (%s, %s, %s)"
     )
     inserted_ips: List[str] = []
     LOGGER.info("Starting tenant IP inserts: tenantname=%s ip_count=%d", tenantname, len(ip_list))
     with conn.cursor() as cur:
         for ip in ip_list:
             LOGGER.debug("Executing tenant IP insert: tenantname=%s ip=%s", tenantname, ip)
-            cur.execute(sql, (tenantname, ip))
+            cur.execute(sql, (tenantname, tenantname, ip))
             inserted_ips.append(ip)
             LOGGER.info(
-                "Tenant IP insert succeeded. tenantname=%s ip=%s affected_rows=%d",
+                "Tenant IP insert succeeded. tenantname=%s clustername=%s tenantip=%s affected_rows=%d",
+                tenantname,
                 tenantname,
                 ip,
                 cur.rowcount,
