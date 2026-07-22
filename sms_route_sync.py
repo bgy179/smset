@@ -174,7 +174,7 @@ def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
 
 
 def extract_wxid(api_result: Any) -> str | None:
-    """Extract wxid from execSql fixed response: {code, msg, data:[{UserName,...}]}"""
+    """Extract wxid from execSql fixed response: {code, msg, data:[{wxid,...}]}"""
     if not isinstance(api_result, dict):
         return None
     if api_result.get("code") != 200:
@@ -189,9 +189,9 @@ def extract_wxid(api_result: Any) -> str | None:
     for item in data:
         if not isinstance(item, dict):
             continue
-        user_name = item.get("UserName")
-        if isinstance(user_name, str) and user_name.strip():
-            return user_name.strip()
+        wxid = item.get("wxid")
+        if isinstance(wxid, str) and wxid.strip():
+            return wxid.strip()
     return None
 
 
