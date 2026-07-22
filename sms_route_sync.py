@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 try:
     import pymysql
@@ -37,6 +37,20 @@ SOURCE_ID_COLUMN = "id"
 SOURCE_MESSAGE_COLUMN = "message_content"
 SOURCE_STATUS_COLUMN = "send_status"
 SOURCE_SENDER_COLUMN = "sender"
+SOURCE_SCHEMA = "zbxalerts"
+SOURCE_TABLE = "decoded_sms"
+TARGET_SCHEMA = "wzwmonitor"
+TARGET_TABLE = "wechat_chatroom"
+WECHAT_DB_NAME = "MicroMsg.db"
+DEFAULT_ALLOWED_SENDERS = "8618710029810,8618612310179"
+USED_CONFIG_KEYS = {
+    "DB_HOST",
+    "DB_PORT",
+    "DB_USER",
+    "DB_PASSWORD",
+    "ALLOWED_SENDERS",
+    "INTERVAL_SECONDS",
+}
 
 
 @dataclass
@@ -47,18 +61,12 @@ class AppConfig:
     db_port: int
     db_user: str
     db_password: str
-    source_schema: str
-    source_table: str
-    target_schema: str
-    target_table: str
     api_url: str
-    wechat_db_name: str
     batch_size: int
     http_timeout: float
     success_status: int
     error_status: int
     chatroom_type: str
-    sender_column: Optional[str]
     allowed_senders: Set[str]
     interval_seconds: int
 
@@ -96,7 +104,10 @@ def parse_flat_ini(path: str) -> Dict[str, str]:
                 if "=" not in line:
                     continue
                 key, value = line.split("=", 1)
-                values[key.strip()] = value.strip()
+                normalized_key = key.strip()
+                if normalized_key not in USED_CONFIG_KEYS:
+                    continue
+                values[normalized_key] = value.strip()
     except FileNotFoundError:
         LOGGER.debug("Config file not found: %s", path)
         return values
@@ -116,7 +127,7 @@ def parse_sender_whitelist(raw: str) -> Set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
-def parse_sms_route_command(message: str) -> Optional[str]:
+def parse_sms_route_command(message: str) -> str | None:
     """Parse command text and return nick_name for a valid _smsRoute command.
 
     Expected format:
@@ -162,41 +173,38 @@ def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
         raise RuntimeError(f"execSql returned non-JSON response: {body[:300]}") from exc
 
 
-def iter_dicts(obj: Any) -> Iterable[Dict[str, Any]]:
-    """Yield all dict nodes found recursively in nested dict/list structures."""
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from iter_dicts(v)
-    elif isinstance(obj, list):
-        for item in obj:
-            yield from iter_dicts(item)
+def extract_wxid(api_result: Any) -> str | None:
+    """Extract wxid from execSql fixed response: {code, msg, data:[{UserName,...}]}"""
+    if not isinstance(api_result, dict):
+        return None
+    if api_result.get("code") != 200:
+        return None
+    if api_result.get("msg") != "success":
+        return None
 
+    data = api_result.get("data")
+    if not isinstance(data, list):
+        return None
 
-def extract_wxid(api_result: Any) -> Optional[str]:
-    """Extract first non-empty wxid-like field from arbitrary API JSON payload."""
-    key_candidates = ("wxid", "UserName", "userName", "username", "wxId")
-    for d in iter_dicts(api_result):
-        for key in key_candidates:
-            val = d.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        user_name = item.get("UserName")
+        if isinstance(user_name, str) and user_name.strip():
+            return user_name.strip()
     return None
 
 
-def lookup_chatroom_wxid(
-    api_url: str, wechat_db_name: str, nick_name: str, timeout: float
-) -> str:
+def lookup_chatroom_wxid(api_url: str, nick_name: str, timeout: float) -> str:
     """Query WeChat DB through execSql API and resolve chatroom wxid by nickname."""
     safe_name = quote_sql(nick_name)
     sql = (
         "SELECT UserName AS wxid, NickName "
         "FROM Contact "
-        f"WHERE NickName = '{safe_name}' "
-        "AND UserName LIKE '%@chatroom' "
+        f"WHERE Type=2 AND NickName='{safe_name}' "
         "LIMIT 1"
     )
-    result = http_exec_sql(api_url=api_url, db_name=wechat_db_name, sql=sql, timeout=timeout)
+    result = http_exec_sql(api_url=api_url, db_name=WECHAT_DB_NAME, sql=sql, timeout=timeout)
     wxid = extract_wxid(result)
     if not wxid:
         raise RuntimeError(f"No wxid found for nick_name='{nick_name}'. API result: {result}")
@@ -216,7 +224,7 @@ def insert_chatroom_row(
     `tenantname`, so repeated commands should refresh the existing row instead of failing.
     """
     sql = (
-        "INSERT INTO `wzwmonitor`.`wechat_chatroom` "
+        f"INSERT INTO `{TARGET_SCHEMA}`.`{TARGET_TABLE}` "
         "(wxid, nickname, chatroom_type, tenantname) "
         "VALUES (%s, %s, %s, %s) "
         "ON DUPLICATE KEY UPDATE "
@@ -237,7 +245,7 @@ def update_sms_status(
 ) -> None:
     """Update one decoded_sms row status after processing."""
     sql = (
-        "UPDATE `zbxalerts`.`decoded_sms` "
+        f"UPDATE `{SOURCE_SCHEMA}`.`{SOURCE_TABLE}` "
         "SET `send_status`=%s WHERE `id`=%s"
     )
     with conn.cursor() as cur:
@@ -256,12 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db-port", type=int, default=3306)
     p.add_argument("--db-user", default="root")
     p.add_argument("--db-password", default="123456")
-    p.add_argument("--source-schema", default="zbxalerts")
-    p.add_argument("--source-table", default="decoded_sms")
-    p.add_argument("--target-schema", default="wzwmonitor")
-    p.add_argument("--target-table", default="wechat_chatroom")
     p.add_argument("--api-url", default="http://192.168.136.1:8080/api/execSql")
-    p.add_argument("--wechat-db-name", default="MicroMsg")
     p.add_argument("--batch-size", type=int, default=100)
     p.add_argument("--http-timeout", type=float, default=5.0)
     p.add_argument("--success-status", type=int, default=1)
@@ -272,13 +275,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Value written to wechat_chatroom.chatroom_type.",
     )
     p.add_argument(
-        "--sender-column",
-        help="Override sender column name in decoded_sms (e.g. sender_number/phone).",
-    )
-    p.add_argument(
         "--allowed-senders",
         help="Comma-separated sender whitelist. Only these senders are treated as commands.",
-        default="8618710029810,8618612310179",
+        default=DEFAULT_ALLOWED_SENDERS,
     )
     p.add_argument(
         "--log-level",
@@ -307,7 +306,6 @@ def load_config(args: argparse.Namespace) -> AppConfig:
     db_port = args.db_port or int(cfg.get("DB_PORT", "3306"))
     db_user = args.db_user or cfg.get("DB_USER", "root")
     db_password = args.db_password or cfg.get("DB_PASSWORD", "")
-    sender_column = args.sender_column or cfg.get("SENDER_COLUMN")
     allowed_senders = parse_sender_whitelist(
         args.allowed_senders or cfg.get("ALLOWED_SENDERS", "")
     )
@@ -315,11 +313,7 @@ def load_config(args: argparse.Namespace) -> AppConfig:
     if interval_seconds <= 0:
         interval_seconds = 60
     LOGGER.debug(
-        "Config loaded. source=%s.%s target=%s.%s whitelist_size=%d",
-        args.source_schema,
-        args.source_table,
-        args.target_schema,
-        args.target_table,
+        "Config loaded. whitelist_size=%d",
         len(allowed_senders),
     )
 
@@ -328,18 +322,12 @@ def load_config(args: argparse.Namespace) -> AppConfig:
         db_port=db_port,
         db_user=db_user,
         db_password=db_password,
-        source_schema=args.source_schema,
-        source_table=args.source_table,
-        target_schema=args.target_schema,
-        target_table=args.target_table,
         api_url=args.api_url,
-        wechat_db_name=args.wechat_db_name,
         batch_size=args.batch_size,
         http_timeout=args.http_timeout,
         success_status=args.success_status,
         error_status=args.error_status,
         chatroom_type=args.chatroom_type,
-        sender_column=sender_column,
         allowed_senders=allowed_senders,
         interval_seconds=interval_seconds,
     )
@@ -352,34 +340,26 @@ def run_sync_cycle(cfg: AppConfig) -> int:
         port=cfg.db_port,
         user=cfg.db_user,
         password=cfg.db_password,
-        database=cfg.source_schema,
+        database=SOURCE_SCHEMA,
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=False,
     )
 
     try:
-        sender_col = cfg.sender_column or SOURCE_SENDER_COLUMN
-
         LOGGER.info(
             "Resolved columns. id=%s message=%s status=%s sender=%s",
             SOURCE_ID_COLUMN,
             SOURCE_MESSAGE_COLUMN,
             SOURCE_STATUS_COLUMN,
-            sender_col,
+            SOURCE_SENDER_COLUMN,
         )
 
-        select_fields = [
-            f"`{SOURCE_ID_COLUMN}` AS row_id",
-            f"`{SOURCE_MESSAGE_COLUMN}` AS message",
-        ]
-        if sender_col:
-            select_fields.append(f"`{sender_col}` AS sender")
-
         select_sql = (
-            "SELECT "
-            + ", ".join(select_fields)
-            + f" FROM `{cfg.source_schema}`.`{cfg.source_table}` "
+            f"SELECT `{SOURCE_ID_COLUMN}` AS row_id, "
+            f"`{SOURCE_MESSAGE_COLUMN}` AS message, "
+            f"`{SOURCE_SENDER_COLUMN}` AS sender "
+            + f" FROM `{SOURCE_SCHEMA}`.`{SOURCE_TABLE}` "
             + f"WHERE `{SOURCE_STATUS_COLUMN}`=0 "
             + f"ORDER BY `{SOURCE_ID_COLUMN}` ASC LIMIT %s"
         )
@@ -420,7 +400,6 @@ def run_sync_cycle(cfg: AppConfig) -> int:
             try:
                 wxid = lookup_chatroom_wxid(
                     api_url=cfg.api_url,
-                    wechat_db_name=cfg.wechat_db_name,
                     nick_name=nick_name,
                     timeout=cfg.http_timeout,
                 )
@@ -466,7 +445,7 @@ def run_sync_cycle(cfg: AppConfig) -> int:
             failed,
             SOURCE_STATUS_COLUMN,
             SOURCE_MESSAGE_COLUMN,
-            sender_col,
+            SOURCE_SENDER_COLUMN,
         )
         return 0 if failed == 0 else 2
     finally:
@@ -483,10 +462,10 @@ def main() -> int:
 
     LOGGER.info(
         "Starting sync service. source=%s.%s target=%s.%s batch_size=%d interval=%ds",
-        cfg.source_schema,
-        cfg.source_table,
-        cfg.target_schema,
-        cfg.target_table,
+        SOURCE_SCHEMA,
+        SOURCE_TABLE,
+        TARGET_SCHEMA,
+        TARGET_TABLE,
         cfg.batch_size,
         cfg.interval_seconds,
     )
