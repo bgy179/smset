@@ -197,6 +197,34 @@ def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
         raise RuntimeError(f"execSql returned non-JSON response: {body[:300]}") from exc
 
 
+def http_post_json(url: str, payload: Dict[str, Any], timeout: float) -> Any:
+    """POST JSON to a local HTTP API and return parsed JSON when possible."""
+    LOGGER.debug("Calling JSON API. url=%s timeout=%.2fs payload=%s", url, timeout, payload)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return body
+
+
+def build_sendtxtmsg_url(api_url: str) -> str:
+    """Build sendtxtmsg endpoint from execSql endpoint."""
+    marker = "/api/execSql"
+    if api_url.endswith(marker):
+        return api_url[: -len(marker)] + "/api/sendtxtmsg"
+    return api_url.rstrip("/") + "/api/sendtxtmsg"
+
+
 def extract_wxid(api_result: Any) -> str | None:
     """Extract wxid from execSql fixed response: {code, msg, data:[{wxid,...}]}"""
     if not isinstance(api_result, dict):
@@ -258,21 +286,48 @@ def insert_tenant_ip_rows(
     conn: pymysql.connections.Connection,
     tenantname: str,
     ip_list: List[str],
-) -> None:
+) -> List[str]:
     """Insert one paas_cluster_tenantname_ip row for each IP using tenantname=wxid."""
     sql = (
         "INSERT INTO `wzwmonitor`.`paas_cluster_tenantname_ip` "
         "(tenantname, ip) VALUES (%s, %s)"
     )
+    inserted_ips: List[str] = []
     with conn.cursor() as cur:
         for ip in ip_list:
             cur.execute(sql, (tenantname, ip))
+            inserted_ips.append(ip)
             LOGGER.info(
                 "Tenant IP insert succeeded. tenantname=%s ip=%s affected_rows=%d",
                 tenantname,
                 ip,
                 cur.rowcount,
             )
+    return inserted_ips
+
+
+def send_register_result_message(
+    api_url: str,
+    wxid: str,
+    nick_name: str,
+    inserted_ips: List[str],
+    timeout: float,
+) -> None:
+    """Send a summary message to the target WeChat chatroom after register succeeds."""
+    if not inserted_ips:
+        raise RuntimeError(f"No IPs inserted for nick_name='{nick_name}', message will not be sent")
+
+    sendtxtmsg_url = build_sendtxtmsg_url(api_url)
+    message = "_smsRegister succeeded. inserted IPs: " + ", ".join(inserted_ips)
+    payload = {"wxid": wxid, "content": message}
+    result = http_post_json(sendtxtmsg_url, payload, timeout)
+    LOGGER.info(
+        "sendtxtmsg succeeded. nick_name=%s wxid=%s ip_count=%d response=%r",
+        nick_name,
+        wxid,
+        len(inserted_ips),
+        result,
+    )
 
 
 def insert_chatroom_row(
@@ -517,17 +572,24 @@ def run_sync_cycle(cfg: AppConfig) -> int:
                     )
                 else:
                     wxid = lookup_chatroom_wxid_by_nickname(conn=conn, nick_name=command.nick_name)
-                    insert_tenant_ip_rows(
+                    inserted_ips = insert_tenant_ip_rows(
                         conn=conn,
                         tenantname=wxid,
                         ip_list=command.ip_list,
+                    )
+                    send_register_result_message(
+                        api_url=cfg.api_url,
+                        wxid=wxid,
+                        nick_name=command.nick_name,
+                        inserted_ips=inserted_ips,
+                        timeout=cfg.http_timeout,
                     )
                     LOGGER.info(
                         "Processed _smsRegister row_id=%s nick_name=%s wxid=%s ip_count=%d",
                         row_id,
                         command.nick_name,
                         wxid,
-                        len(command.ip_list),
+                        len(inserted_ips),
                     )
 
                 update_sms_status(
