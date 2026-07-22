@@ -182,11 +182,24 @@ def launch_detached_child(args: argparse.Namespace) -> int:
         if arg not in ("--daemon", "--stop")
     ]
     child_argv.append("--daemon-child")
-    cmd = [sys.executable, os.path.abspath(__file__), *child_argv]
+
+    python_exe = sys.executable
+    if os.name == "nt":
+        exe_lower = python_exe.lower()
+        if exe_lower.endswith("python.exe"):
+            pythonw_exe = python_exe[:-10] + "pythonw.exe"
+            if os.path.exists(pythonw_exe):
+                python_exe = pythonw_exe
+
+    cmd = [python_exe, os.path.abspath(__file__), *child_argv]
 
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NO_WINDOW
+        )
 
     LOGGER.info("Launching detached child process: %s", cmd)
     subprocess.Popen(
