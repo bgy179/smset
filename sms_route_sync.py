@@ -522,7 +522,7 @@ def send_register_result_message(
         raise RuntimeError(f"No IPs inserted for nick_name='{nick_name}', message will not be sent")
 
     sendtxtmsg_url = build_sendtxtmsg_url(api_url)
-    message = "_smsRegister succeeded. inserted IPs: " + ", ".join(inserted_ips)
+    message = "_smsRegister succeeded. inserted %d IPs: %s" % (len(inserted_ips), ", ".join(inserted_ips))
     payload = {"wxid": wxid, "content": message}
     LOGGER.info(
         "Sending register result message: nick_name=%s wxid=%s ip_count=%d url=%s",
@@ -540,6 +540,30 @@ def send_register_result_message(
         result,
     )
 
+def send_route_result_message(
+    api_url: str,
+    wxid: str,
+    nick_name: str,
+    timeout: float,
+) -> None:
+    """Send a summary message to the target WeChat chatroom after route building succeeds."""
+
+    sendtxtmsg_url = build_sendtxtmsg_url(api_url)
+    message = "Route to this group built. Group wxid is %s" % wxid
+    payload = {"wxid": wxid, "content": message}
+    LOGGER.info(
+        "Sending route result message: nick_name=%s wxid=%s url=%s",
+        nick_name,
+        wxid,
+        sendtxtmsg_url,
+    )
+    result = http_post_json(sendtxtmsg_url, payload, timeout)
+    LOGGER.info(
+        "sendtxtmsg succeeded. nick_name=%s wxid=%s response=%r",
+        nick_name,
+        wxid,
+        result,
+    )
 
 def insert_chatroom_row(
     conn: pymysql.connections.Connection,
@@ -844,6 +868,12 @@ def run_sync_cycle(cfg: AppConfig) -> int:
                         wxid=wxid,
                         nick_name=command.nick_name,
                         tenantname=tenantname,
+                    )
+                    send_route_result_message(
+                        api_url=cfg.api_url,
+                        wxid=wxid,
+                        nick_name=command.nick_name,
+                        timeout=cfg.http_timeout,
                     )
                     LOGGER.info(
                         "Processed _smsRoute row_id=%s nick_name=%s wxid=%s tenantname=%s",
