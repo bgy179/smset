@@ -771,16 +771,26 @@ def run_sync_cycle(cfg: AppConfig) -> int:
             "sender",
         )
 
+        select_params: List[Any] = []
         select_sql = (
             "SELECT `id` AS row_id, `message_content` AS message, `sender` AS sender "
             "FROM `zbxalerts`.`decoded_sms` "
-            "WHERE `send_status`=0 "
-            "ORDER BY `id` ASC LIMIT %s"
+            "WHERE `send_status`=0"
         )
+        if cfg.allowed_senders:
+            sender_placeholders = ", ".join(["%s"] * len(cfg.allowed_senders))
+            select_sql += f" AND `sender` IN ({sender_placeholders})"
+            select_params.extend(sorted(cfg.allowed_senders))
+        select_sql += " ORDER BY `id` ASC LIMIT %s"
+        select_params.append(cfg.batch_size)
 
         with conn.cursor() as cur:
-            LOGGER.debug("Executing pending SMS select: batch_size=%d", cfg.batch_size)
-            cur.execute(select_sql, (cfg.batch_size,))
+            LOGGER.debug(
+                "Executing pending SMS select: batch_size=%d whitelist_size=%d",
+                cfg.batch_size,
+                len(cfg.allowed_senders),
+            )
+            cur.execute(select_sql, tuple(select_params))
             rows: List[Dict[str, Any]] = list(cur.fetchall())
         LOGGER.info("Fetched pending rows: %d", len(rows))
 
