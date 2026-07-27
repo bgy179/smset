@@ -28,6 +28,8 @@
 #define SERVICE_DESC_W     L"采集Air780短信，根据IP内存路由表分发至多个微信群，含断线重试补偿"
 #define BAUD_RATE          CBR_115200
 #define DB_PORT         3306
+#define DB_RETRY_INTERVAL_MS 5000
+#define DB_QUERY_RETRY_MAX 1
 
 #define HASH_BUCKET_COUNT    1024
 #define MAX_WXID_PER_QUERY   64   
@@ -556,17 +558,179 @@ static void copy_entry_to_result(cache_entry_t *e, wxid_result_t *result) {
 
 // ===================== 数据库连接与路由数据加载 =====================
 static MYSQL *db_connect(void) {
-    MYSQL *conn = mysql_init(NULL);
-    if (!conn) return NULL;
-        
-    int ssl_mode = 0;
-    mysql_options(conn, MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &ssl_mode);
-    if (!mysql_real_connect(conn, g_cfg.db_host, g_cfg.db_user, g_cfg.db_password, g_cfg.db_name, DB_PORT, NULL, 0)) {
-        WriteLog("[数据库] 连接失败，宿主机: %s, 错误原因: %s", g_cfg.db_host, mysql_error(conn));
-        mysql_close(conn); return NULL;
+    int retry_count = 0;
+
+    for (;;) {
+        MYSQL *conn = mysql_init(NULL);
+        if (!conn) {
+            retry_count++;
+            WriteLog("[数据库] mysql_init 失败，第 %d 次重试将在 %d 秒后进行", retry_count, DB_RETRY_INTERVAL_MS / 1000);
+        } else {
+            int ssl_mode = 0;
+            mysql_options(conn, MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &ssl_mode);
+            if (mysql_real_connect(conn, g_cfg.db_host, g_cfg.db_user, g_cfg.db_password, g_cfg.db_name, DB_PORT, NULL, 0)) {
+                mysql_set_character_set(conn, "utf8mb4");
+                if (retry_count > 0) {
+                    WriteLog("[数据库] 第 %d 次重试后连接恢复成功，宿主机: %s", retry_count, g_cfg.db_host);
+                }
+                return conn;
+            }
+
+            retry_count++;
+            WriteLog("[数据库] 连接失败，宿主机: %s, 错误原因: %s", g_cfg.db_host, mysql_error(conn));
+            WriteLog("[数据库] 第 %d 次重试将在 %d 秒后进行", retry_count, DB_RETRY_INTERVAL_MS / 1000);
+            mysql_close(conn);
+        }
+
+        if (g_hStopEvent && WaitForSingleObject(g_hStopEvent, DB_RETRY_INTERVAL_MS) == WAIT_OBJECT_0) {
+            WriteLog("[数据库] 接收到服务停止信号，终止数据库重连");
+            return NULL;
+        }
+        if (!g_hStopEvent) {
+            Sleep(DB_RETRY_INTERVAL_MS);
+        }
     }
-    mysql_set_character_set(conn, "utf8mb4");
-    return conn;
+}
+
+static bool is_mysql_connection_error(unsigned int err_code) {
+    return err_code == 2002 ||  // CR_CONNECTION_ERROR
+           err_code == 2003 ||  // CR_CONN_HOST_ERROR
+           err_code == 2006 ||  // CR_SERVER_GONE_ERROR
+           err_code == 2013 ||  // CR_SERVER_LOST
+           err_code == 2055;    // CR_SERVER_LOST_EXTENDED
+}
+
+static int db_query_with_reconnect(MYSQL **conn_ref, const char *sql, const char *log_tag) {
+    if (!conn_ref || !sql || !log_tag) return -1;
+
+    int retry_count = 0;
+    for (;;) {
+        if (!*conn_ref) {
+            *conn_ref = db_connect();
+            if (!*conn_ref) {
+                WriteLog("[%s] 无法建立数据库连接，SQL执行终止", log_tag);
+                return -1;
+            }
+        }
+
+        if (mysql_query(*conn_ref, sql) == 0) {
+            if (retry_count > 0) {
+                WriteLog("[%s] 数据库重连后 SQL 重试成功", log_tag);
+            }
+            return 0;
+        }
+
+        unsigned int err_code = mysql_errno(*conn_ref);
+        const char *err_msg = mysql_error(*conn_ref);
+        if (!is_mysql_connection_error(err_code) || retry_count >= DB_QUERY_RETRY_MAX) {
+            WriteLog("[%s] SQL执行失败，错误码=%u，原因=%s", log_tag, err_code, err_msg);
+            return -1;
+        }
+
+        WriteLog("[%s] SQL执行遇到断连，错误码=%u，准备重连后重试", log_tag, err_code);
+        mysql_close(*conn_ref);
+        *conn_ref = NULL;
+        retry_count++;
+    }
+}
+
+static int insert_decoded_sms_with_reconnect(MYSQL **conn_ref,
+                                             const char *sender,
+                                             uint16_t ref_num,
+                                             bool is_16bit,
+                                             const char *content_utf8,
+                                             const char *target_wxid) {
+    if (!conn_ref || !sender || !content_utf8 || !target_wxid) return -1;
+
+    int retry_count = 0;
+    for (;;) {
+        if (!*conn_ref) {
+            *conn_ref = db_connect();
+            if (!*conn_ref) {
+                WriteLog("[预编译异常] 无法建立数据库连接，decoded_sms 写入终止");
+                return -1;
+            }
+        }
+
+        int inserted_id = -1;
+        MYSQL_STMT *stmt = mysql_stmt_init(*conn_ref);
+        if (!stmt) {
+            unsigned int err_code = mysql_errno(*conn_ref);
+            if (is_mysql_connection_error(err_code) && retry_count < DB_QUERY_RETRY_MAX) {
+                WriteLog("[预编译异常] mysql_stmt_init 遇到断连，准备重连重试");
+                mysql_close(*conn_ref);
+                *conn_ref = NULL;
+                retry_count++;
+                continue;
+            }
+            WriteLog("[预编译异常] mysql_stmt_init 失败，错误码=%u，原因=%s", err_code, mysql_error(*conn_ref));
+            return -1;
+        }
+
+        const char *sql = "INSERT INTO decoded_sms (sender, ref_num, is_16bit, message_content, target_wxid, send_status) VALUES (?, ?, ?, ?, ?, 0);";
+        if (mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+            unsigned int err_code = mysql_stmt_errno(stmt);
+            const char *err_msg = mysql_stmt_error(stmt);
+            mysql_stmt_close(stmt);
+
+            if (is_mysql_connection_error(err_code) && retry_count < DB_QUERY_RETRY_MAX) {
+                WriteLog("[预编译异常] prepare 阶段断连，错误码=%u，准备重连重试", err_code);
+                mysql_close(*conn_ref);
+                *conn_ref = NULL;
+                retry_count++;
+                continue;
+            }
+
+            WriteLog("[预编译异常] 写入明文表 decoded_sms 失败，错误码=%u，原因=%s", err_code, err_msg);
+            return -1;
+        }
+
+        MYSQL_BIND bind[5];
+        memset(bind, 0, sizeof(bind));
+        unsigned long sender_len = strlen(sender);
+        unsigned long content_len = strlen(content_utf8);
+        unsigned long wxid_len = strlen(target_wxid);
+        int is_16bit_int = is_16bit ? 1 : 0;
+
+        bind[0].buffer_type = MYSQL_TYPE_STRING;
+        bind[0].buffer = (char*)sender;
+        bind[0].buffer_length = sender_len;
+        bind[1].buffer_type = MYSQL_TYPE_SHORT;
+        bind[1].buffer = &ref_num;
+        bind[2].buffer_type = MYSQL_TYPE_TINY;
+        bind[2].buffer = &is_16bit_int;
+        bind[3].buffer_type = MYSQL_TYPE_STRING;
+        bind[3].buffer = (char*)content_utf8;
+        bind[3].buffer_length = content_len;
+        bind[4].buffer_type = MYSQL_TYPE_STRING;
+        bind[4].buffer = (char*)target_wxid;
+        bind[4].buffer_length = wxid_len;
+
+        mysql_stmt_bind_param(stmt, bind);
+        if (mysql_stmt_execute(stmt) == 0) {
+            inserted_id = (int)mysql_insert_id(*conn_ref);
+            mysql_stmt_close(stmt);
+            if (retry_count > 0) {
+                WriteLog("[预编译异常] 重连后 decoded_sms 写入恢复成功");
+            }
+            return inserted_id;
+        }
+
+        unsigned int err_code = mysql_stmt_errno(stmt);
+        const char *err_msg = mysql_stmt_error(stmt);
+        mysql_stmt_close(stmt);
+
+        if (is_mysql_connection_error(err_code) && retry_count < DB_QUERY_RETRY_MAX) {
+            WriteLog("[预编译异常] execute 阶段断连，错误码=%u，准备重连重试", err_code);
+            mysql_close(*conn_ref);
+            *conn_ref = NULL;
+            retry_count++;
+            continue;
+        }
+
+        WriteLog("[预编译异常] 写入明文表 decoded_sms 失败，错误码=%u，原因=%s", err_code, err_msg);
+        return -1;
+    }
 }
 
 static int cache_full_refresh(void) {
@@ -579,8 +743,7 @@ static int cache_full_refresh(void) {
     const char *sql = "SELECT t.tenantname, t.tenantip, c.wxid, c.nickname "
                       "FROM wzwmonitor.paas_cluster_tenantname_ip t "
                       "JOIN wzwmonitor.wechat_chatroom c ON t.tenantname = c.tenantname";
-    if (mysql_query(conn, sql) != 0) { 
-        WriteLog("[路由缓存] SQL执行错误: %s", mysql_error(conn));
+    if (db_query_with_reconnect(&conn, sql, "路由缓存") != 0) { 
         mysql_close(conn); return -1; 
     }
     MYSQL_RES *res = mysql_store_result(conn);
@@ -619,7 +782,7 @@ static int query_db_by_ip(const char *tenantip, wxid_result_t *result) {
         "JOIN wzwmonitor.wechat_chatroom c ON t.tenantname = c.tenantname "
         "WHERE t.tenantip = '%s'", escaped_ip);
 
-    if (mysql_query(conn, sql) != 0) { mysql_close(conn); return -1; }
+    if (db_query_with_reconnect(&conn, sql, "路由查找") != 0) { mysql_close(conn); return -1; }
     MYSQL_RES *res = mysql_store_result(conn);
     if (!res) { mysql_close(conn); return -1; }
     MYSQL_ROW row;
@@ -797,41 +960,12 @@ void dispatch_decoded_sms(const char *sender, uint16_t ref_num, bool is_16bit, c
     }
 
     for (int i = 0; i < route_result.count; i++) {
-        int inserted_id = -1;
-        MYSQL_STMT *stmt = mysql_stmt_init(mysql);
-        if (stmt) {
-            const char *sql = "INSERT INTO decoded_sms (sender, ref_num, is_16bit, message_content, target_wxid, send_status) VALUES (?, ?, ?, ?, ?, 0);";
-            if (mysql_stmt_prepare(stmt, sql, strlen(sql)) == 0) {
-                MYSQL_BIND bind[5]; 
-                memset(bind, 0, sizeof(bind));
-                unsigned long sender_len = strlen(sender);
-                unsigned long content_len = strlen(content_utf8);
-                unsigned long wxid_len = strlen(route_result.wxids[i]);
-                int is_16bit_int = is_16bit ? 1 : 0;
-
-                bind[0].buffer_type = MYSQL_TYPE_STRING; 
-                bind[0].buffer = (char*)sender; 
-                bind[0].buffer_length = sender_len;
-                bind[1].buffer_type = MYSQL_TYPE_SHORT; 
-                bind[1].buffer = &ref_num;
-                bind[2].buffer_type = MYSQL_TYPE_TINY; 
-                bind[2].buffer = &is_16bit_int;
-                bind[3].buffer_type = MYSQL_TYPE_STRING; 
-                bind[3].buffer = (char*)content_utf8; 
-                bind[3].buffer_length = content_len;
-                bind[4].buffer_type = MYSQL_TYPE_STRING; 
-                bind[4].buffer = route_result.wxids[i]; 
-                bind[4].buffer_length = wxid_len;
-
-                mysql_stmt_bind_param(stmt, bind);
-                if(mysql_stmt_execute(stmt) == 0) {
-                    inserted_id = (int)mysql_insert_id(mysql);
-                } else {
-                    WriteLog("[预编译异常] 写入明文表 decoded_sms 失败: %s", mysql_stmt_error(stmt));
-                }
-            }
-            mysql_stmt_close(stmt);
-        }
+        int inserted_id = insert_decoded_sms_with_reconnect(&mysql,
+                                                            sender,
+                                                            ref_num,
+                                                            is_16bit,
+                                                            content_utf8,
+                                                            route_result.wxids[i]);
 
         if (inserted_id != -1) {
             WriteLog("[落库回执] 明文解析数据已成功录入系统底层 (表ID: %d) -> 拟下发群: %s", inserted_id, route_result.wxids[i]);
@@ -862,7 +996,7 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
 
         // WriteLog("[后台线程] 扫描待发送消息队列...");
         const char *sql = "SELECT id, target_wxid, message_content FROM decoded_sms WHERE send_status = 0 ORDER BY id ASC LIMIT 50;";
-        if (mysql_query(async_mysql, sql) == 0) {
+        if (db_query_with_reconnect(&async_mysql, sql, "后台线程") == 0) {
             MYSQL_RES *res = mysql_store_result(async_mysql);
             if (res) {
                 int row_count = 0;
@@ -878,7 +1012,10 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
                         WriteLog("[下发成功] 目标微信群已安全接收 (明文数据表ID: %d)", id);
                         char up_sql[128]; 
                         snprintf(up_sql, sizeof(up_sql), "UPDATE decoded_sms SET send_status=1 WHERE id=%d", id);
-                        mysql_query(async_mysql, up_sql);
+                        if (db_query_with_reconnect(&async_mysql, up_sql, "后台线程") != 0) {
+                            WriteLog("[后台线程] 更新 send_status 失败，ID=%d", id);
+                            break;
+                        }
                     } else {
                         WriteLog("[下发阻断] 推送遭遇故障（已触发布局挂起重试策略机制，ID: %d）", id);
                         break; 
@@ -892,7 +1029,7 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
                 WriteLog("[后台线程] mysql_store_result 返回 NULL");
             }
         } else {
-            WriteLog("[后台线程] 数据库查询失败: %s", mysql_error(async_mysql));
+            WriteLog("[后台线程] 数据库查询失败");
         }
         
         mysql_close(async_mysql);
@@ -1245,7 +1382,9 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
             dispatch_decoded_sms(frame->sender, 0, false, utf8_buf);
             char sql[128]; 
             snprintf(sql, sizeof(sql), "UPDATE raw_sms SET status=1 WHERE id=%d", raw_table_id); 
-            mysql_query(mysql, sql);
+            if (db_query_with_reconnect(&mysql, sql, "短信状态") != 0) {
+                WriteLog("[短信状态] 更新 raw_sms 状态失败，ID=%d", raw_table_id);
+            }
         }
         return;
     }
@@ -1328,7 +1467,9 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
     
     char sql[128]; 
     snprintf(sql, sizeof(sql), "UPDATE raw_sms SET status=1 WHERE id=%d", raw_table_id); 
-    mysql_query(mysql, sql);
+    if (db_query_with_reconnect(&mysql, sql, "短信状态") != 0) {
+        WriteLog("[短信状态] 更新 raw_sms 状态失败，ID=%d", raw_table_id);
+    }
 
     if(target->arrived_count == target->total_parts) {
         WriteLog("[长短信合并] 欢呼吧！所有关联分片已全数集结完毕，启动数据流拼装组装...");
@@ -1438,7 +1579,7 @@ void ParsePduSmsResponse(char* atResp) {
 
                 sprintf(sql, "INSERT INTO raw_sms(msg_index, raw_content, status) VALUES(0, '%s', 0)", raw_esc);
 
-                if (mysql_query(mysql, sql) == 0) {
+                if (db_query_with_reconnect(&mysql, sql, "数据落库") == 0) {
                     int last_id = (int)mysql_insert_id(mysql);
                     WriteLog("[数据落库] 原始PDU成功持久化存储至表 raw_sms (分配的自增ID: %d)", last_id);
                     SMSFrame frame;
@@ -1492,10 +1633,14 @@ BOOL TablesAndMysqlInit() {
     mysql = db_connect(); 
     if (!mysql) return FALSE;
         
-    mysql_query(mysql, "CREATE TABLE IF NOT EXISTS raw_sms (id INT AUTO_INCREMENT PRIMARY KEY, msg_index INT, raw_content TEXT, receive_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, status INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
-    mysql_query(mysql, "CREATE TABLE IF NOT EXISTS decoded_sms (id INT AUTO_INCREMENT PRIMARY KEY, sender VARCHAR(32), ref_num INT, is_16bit TINYINT, message_content TEXT, target_wxid VARCHAR(128), send_status INT DEFAULT 0, receive_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
-    mysql_query(mysql, "ALTER TABLE decoded_sms ADD COLUMN target_wxid VARCHAR(128);");
-    mysql_query(mysql, "ALTER TABLE decoded_sms ADD COLUMN send_status INT DEFAULT 0;");
+    if (db_query_with_reconnect(&mysql, "CREATE TABLE IF NOT EXISTS raw_sms (id INT AUTO_INCREMENT PRIMARY KEY, msg_index INT, raw_content TEXT, receive_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, status INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;", "初始化") != 0) {
+        return FALSE;
+    }
+    if (db_query_with_reconnect(&mysql, "CREATE TABLE IF NOT EXISTS decoded_sms (id INT AUTO_INCREMENT PRIMARY KEY, sender VARCHAR(32), ref_num INT, is_16bit TINYINT, message_content TEXT, target_wxid VARCHAR(128), send_status INT DEFAULT 0, receive_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;", "初始化") != 0) {
+        return FALSE;
+    }
+    db_query_with_reconnect(&mysql, "ALTER TABLE decoded_sms ADD COLUMN target_wxid VARCHAR(128);", "初始化");
+    db_query_with_reconnect(&mysql, "ALTER TABLE decoded_sms ADD COLUMN send_status INT DEFAULT 0;", "初始化");
     
     WriteLog("[初始化] 基础核心业务数据依赖表检查/创建完毕，连接就绪");
     return TRUE;
