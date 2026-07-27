@@ -885,7 +885,7 @@ static int send_wechat_message(const char *wxid, const char *content) {
     if (!marker) {
         WriteLog("[内容清洗] 文本中未检测到 '=>| ' 标记，放弃发送，原始内容: %s", content);
         curl_easy_cleanup(curl);
-		return -1;
+		return -2;
     }
 
     while(*ptr_from != '\0' && ptr_to < new_content + sizeof(new_content) - 1) {
@@ -1001,7 +1001,7 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
         }
 
         // WriteLog("[后台线程] 扫描待发送消息队列...");
-        const char *sql = "SELECT id, target_wxid, message_content FROM decoded_sms WHERE send_status = 0 ORDER BY id ASC LIMIT 50;";
+        const char *sql = "SELECT id, target_wxid, message_content FROM decoded_sms WHERE send_status = 0 and sender = '106589665811' ORDER BY id ASC LIMIT 50;";
         if (db_query_with_reconnect(&async_mysql, sql, "后台线程") == 0) {
             MYSQL_RES *res = mysql_store_result(async_mysql);
             if (res) {
@@ -1012,9 +1012,10 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
                     int id = atoi(row[0]); 
                     const char *target_wxid = row[1]; 
                     const char *content = row[2];
-                    
+                    int ret_code = 0;
                     WriteLog("[下发队列] 扫到待发送任务 (ID: %d), 提取接收群: %s", id, target_wxid);
-                    if (send_wechat_message(target_wxid, content) == 0) {
+                    ret_code = send_wechat_message(target_wxid, content);
+                    if (ret_code == 0) {
                         WriteLog("[下发成功] 目标微信群已安全接收 (明文数据表ID: %d)", id);
                         char up_sql[128]; 
                         snprintf(up_sql, sizeof(up_sql), "UPDATE decoded_sms SET send_status=1 WHERE id=%d", id);
@@ -1022,9 +1023,17 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
                             WriteLog("[后台线程] 更新 send_status 失败，ID=%d", id);
                             break;
                         }
-                    } else {
+                    } else if (ret_code == -1) {
                         WriteLog("[下发阻断] 推送遭遇故障（已触发布局挂起重试策略机制，ID: %d）", id);
                         break; 
+                    } else if (ret_code == -2) {
+                        WriteLog("[下发取消] 推送遭遇不合法消息，ID: %d）", id);
+                        char up_sql2[128]; 
+                        snprintf(up_sql2, sizeof(up_sql2), "UPDATE decoded_sms SET send_status=-2 WHERE id=%d", id);
+                        if (db_query_with_reconnect(&async_mysql, up_sql2, "后台线程") != 0) {
+                            WriteLog("[后台线程] 更新 send_status 失败，ID=%d", id);
+                            break;
+                        }
                     }
                 }
                 mysql_free_result(res);
