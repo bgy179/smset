@@ -284,12 +284,42 @@ def parse_sender_whitelist(raw: str) -> Set[str]:
     return senders
 
 
+def expand_register_ip_item(item: str) -> List[str]:
+    """Expand one register IP token.
+
+    Supports:
+    - single token, e.g. "10.1.2.3"
+    - last-octet range, e.g. "10.1.2.3-8" -> 10.1.2.3..10.1.2.8
+    """
+    token = item.strip()
+    if not token:
+        return []
+
+    match = re.fullmatch(r"(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})-(\d{1,3})", token)
+    if not match:
+        return [token]
+
+    prefix = match.group(1)
+    start = int(match.group(2))
+    end = int(match.group(3))
+
+    if start > 255 or end > 255 or start > end:
+        LOGGER.warning("_smsRegister parse failed: invalid IP range token=%s", token)
+        return []
+
+    expanded = [f"{prefix}.{value}" for value in range(start, end + 1)]
+    LOGGER.debug("Expanded register IP range token=%s to count=%d", token, len(expanded))
+    return expanded
+
+
 def parse_sms_command(message: str) -> SmsCommand | None:
     """Parse supported SMS commands.
 
     Supported formats:
         _smsRoute <nick_name>
         _smsRegister <nick_name> <ip_list>
+    Notes for _smsRegister ip_list:
+        Supports range shorthand in last octet, such as 10.1.2.3-8.
     """
     if not message:
         LOGGER.debug("SMS command parse skipped: empty message")
@@ -333,7 +363,7 @@ def parse_sms_command(message: str) -> SmsCommand | None:
             for item in re.split(r"[;,\s]+", part):
                 ip = item.strip()
                 if ip:
-                    ip_values.append(ip)
+                    ip_values.extend(expand_register_ip_item(ip))
 
         if not ip_values:
             LOGGER.warning("_smsRegister parse failed: empty ip list message=%r", message)
