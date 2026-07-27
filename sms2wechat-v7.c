@@ -887,7 +887,11 @@ static int send_wechat_message(const char *wxid, const char *content) {
     }
 
     while(*ptr_from != '\0' && ptr_to < new_content + sizeof(new_content) - 1) {
-        if(*ptr_from == '|' && *(ptr_from + 1) == ' ') {
+        if(*ptr_from == '\r' && *(ptr_from + 1) == '\n') {
+            *ptr_to = '\n';
+            ptr_to++;
+            ptr_from += 2;
+        } else if(*ptr_from == '|' && *(ptr_from + 1) == ' ') {
             ptr_from += 2;
         } else { 
             *ptr_to = *ptr_from; 
