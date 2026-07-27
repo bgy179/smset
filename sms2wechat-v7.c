@@ -883,9 +883,9 @@ static int send_wechat_message(const char *wxid, const char *content) {
     char *ptr_to = new_content;
 
     if (!marker) {
-        WriteLog("[内容清洗] 文本中未检测到 '=>| ' 标记，复制起点为文本开头");
+        WriteLog("[内容清洗] 文本中未检测到 '=>| ' 标记，放弃发送，原始内容: %s", content);
         curl_easy_cleanup(curl);
-		return 0;
+		return -1;
     }
 
     while(*ptr_from != '\0' && ptr_to < new_content + sizeof(new_content) - 1) {
