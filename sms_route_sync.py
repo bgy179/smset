@@ -274,6 +274,14 @@ def quote_sql(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "''")
 
 
+def truncate_for_log(value: str, max_len: int = 800) -> str:
+    """Truncate long strings for log readability."""
+    if len(value) <= max_len:
+        return value
+    omitted = len(value) - max_len
+    return f"{value[:max_len]} ... (truncated {omitted} chars)"
+
+
 def parse_sender_whitelist(raw: str) -> Set[str]:
     """Parse comma-separated sender whitelist into a normalized set."""
     if not raw:
@@ -385,11 +393,18 @@ def parse_sms_command(message: str) -> SmsCommand | None:
 
 def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
     """Call local execSql HTTP API and return parsed JSON result."""
+    started_at = time.time()
     LOGGER.info("Calling execSql API: url=%s db=%s timeout=%.2fs", api_url, db_name, timeout)
-    LOGGER.debug("execSql request SQL: %s", sql)
+    LOGGER.debug("execSql request SQL (len=%d): %s", len(sql), truncate_for_log(sql))
     payload = {"dbName": db_name, "sql": sql}
-    # Send UTF-8 JSON body and declare charset explicitly.
+    # Send UTF-8 JSON body.
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    LOGGER.debug(
+        "execSql request payload summary: db=%s sql_len=%d payload_bytes=%d",
+        db_name,
+        len(sql),
+        len(data),
+    )
  
     req = urllib.request.Request(
         api_url,
@@ -397,15 +412,58 @@ def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        LOGGER.debug("execSql HTTP response status=%s", getattr(resp, "status", "unknown"))
-        body = resp.read().decode("utf-8", errors="replace")
-    LOGGER.debug("execSql raw response body=%s", body)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", "unknown")
+            body = resp.read().decode("utf-8", errors="replace")
+        elapsed = time.time() - started_at
+        LOGGER.debug(
+            "execSql HTTP response received: status=%s elapsed=%.3fs body_len=%d",
+            status,
+            elapsed,
+            len(body),
+        )
+    except urllib.error.HTTPError as exc:
+        elapsed = time.time() - started_at
+        try:
+            error_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # pragma: no cover
+            error_body = "<failed to read HTTPError body>"
+        LOGGER.error(
+            "execSql HTTPError: code=%s reason=%s elapsed=%.3fs response_body=%s",
+            exc.code,
+            exc.reason,
+            elapsed,
+            truncate_for_log(error_body),
+        )
+        raise
+    except urllib.error.URLError as exc:
+        elapsed = time.time() - started_at
+        LOGGER.error(
+            "execSql URLError: reason=%r elapsed=%.3fs",
+            getattr(exc, "reason", exc),
+            elapsed,
+        )
+        raise
+    LOGGER.debug("execSql raw response body=%s", truncate_for_log(body))
     try:
         parsed = json.loads(body)
         LOGGER.info("execSql API call finished successfully")
+        if isinstance(parsed, dict):
+            LOGGER.debug(
+                "execSql parsed response summary: keys=%s code=%r msg=%r data_type=%s data_len=%s",
+                sorted(parsed.keys()),
+                parsed.get("code"),
+                parsed.get("msg"),
+                type(parsed.get("data")).__name__,
+                len(parsed.get("data")) if isinstance(parsed.get("data"), list) else "n/a",
+            )
         return parsed
     except json.JSONDecodeError as exc:
+        LOGGER.error(
+            "execSql JSON decode failed: body_preview=%s",
+            truncate_for_log(body),
+        )
         raise RuntimeError(f"execSql returned non-JSON response: {body[:300]}") from exc
 
 
@@ -480,14 +538,26 @@ def lookup_chatroom_wxid(api_url: str, nick_name: str, timeout: float) -> str:
     """Query WeChat DB through execSql API and resolve chatroom wxid by nickname."""
     # Use hex(NickName) matching to avoid any server-side Unicode decoding issues
     # when the SQL string contains Chinese characters.
-    nickname_hex = nick_name.encode("utf-8").hex().upper()
-    LOGGER.info("Looking up chatroom wxid via execSql: nick_name=%s nickname_hex=%s", nick_name, nickname_hex)
+    nickname_bytes = nick_name.encode("utf-8")
+    nickname_hex = nickname_bytes.hex().upper()
+    LOGGER.info(
+        "Looking up chatroom wxid via execSql: nick_name=%r nick_name_len=%d utf8_bytes_len=%d",
+        nick_name,
+        len(nick_name),
+        len(nickname_bytes),
+    )
+    LOGGER.debug(
+        "Chatroom nickname hex built: hex_len=%d hex_value=%s",
+        len(nickname_hex),
+        nickname_hex,
+    )
     sql = (
         "SELECT UserName AS wxid, NickName "
         "FROM Contact "
         f"WHERE Type=2 AND hex(NickName)='{nickname_hex}' "
         "LIMIT 1"
     )
+    LOGGER.debug("Chatroom lookup SQL prepared: %s", sql)
     result = http_exec_sql(api_url=api_url, db_name="MicroMsg.db", sql=sql, timeout=timeout)
     wxid = extract_wxid(result)
     if not wxid:
