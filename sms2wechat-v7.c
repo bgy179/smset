@@ -639,7 +639,8 @@ static int insert_decoded_sms_with_reconnect(MYSQL **conn_ref,
                                              uint16_t ref_num,
                                              bool is_16bit,
                                              const char *content_utf8,
-                                             const char *target_wxid) {
+                                             const char *target_wxid,
+                                             int initial_send_status) {
     if (!conn_ref || !sender || !content_utf8 || !target_wxid) return -1;
 
     int retry_count = 0;
@@ -667,7 +668,7 @@ static int insert_decoded_sms_with_reconnect(MYSQL **conn_ref,
             return -1;
         }
 
-        const char *sql = "INSERT INTO decoded_sms (sender, ref_num, is_16bit, message_content, target_wxid, send_status) VALUES (?, ?, ?, ?, ?, 0);";
+        const char *sql = "INSERT INTO decoded_sms (sender, ref_num, is_16bit, message_content, target_wxid, send_status) VALUES (?, ?, ?, ?, ?, ?);";
         if (mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
             unsigned int err_code = mysql_stmt_errno(stmt);
             const char *err_msg = mysql_stmt_error(stmt);
@@ -685,12 +686,13 @@ static int insert_decoded_sms_with_reconnect(MYSQL **conn_ref,
             return -1;
         }
 
-        MYSQL_BIND bind[5];
+        MYSQL_BIND bind[6];
         memset(bind, 0, sizeof(bind));
         unsigned long sender_len = strlen(sender);
         unsigned long content_len = strlen(content_utf8);
         unsigned long wxid_len = strlen(target_wxid);
         int is_16bit_int = is_16bit ? 1 : 0;
+        int send_status_int = initial_send_status;
 
         bind[0].buffer_type = MYSQL_TYPE_STRING;
         bind[0].buffer = (char*)sender;
@@ -705,6 +707,9 @@ static int insert_decoded_sms_with_reconnect(MYSQL **conn_ref,
         bind[4].buffer_type = MYSQL_TYPE_STRING;
         bind[4].buffer = (char*)target_wxid;
         bind[4].buffer_length = wxid_len;
+        bind[5].buffer_type = MYSQL_TYPE_LONG;
+        bind[5].buffer = &send_status_int;
+        bind[5].buffer_length = sizeof(send_status_int);
 
         mysql_stmt_bind_param(stmt, bind);
         if (mysql_stmt_execute(stmt) == 0) {
@@ -949,7 +954,7 @@ static int send_wechat_message(const char *wxid, const char *content) {
 }
 
 // ===================== 核心分发：纯异步落库 =====================
-void dispatch_decoded_sms(const char *sender, uint16_t ref_num, bool is_16bit, const char *content_utf8) {
+void dispatch_decoded_sms(const char *sender, uint16_t ref_num, bool is_16bit, const char *content_utf8, int initial_send_status) {
     char ip[64];
     wxid_result_t route_result;
     route_result.count = 0;
@@ -971,7 +976,8 @@ void dispatch_decoded_sms(const char *sender, uint16_t ref_num, bool is_16bit, c
                                                             ref_num,
                                                             is_16bit,
                                                             content_utf8,
-                                                            route_result.wxids[i]);
+                                                            route_result.wxids[i],
+                                                            initial_send_status);
 
         if (inserted_id != -1) {
             WriteLog("[落库回执] 明文解析数据已成功录入系统底层 (表ID: %d) -> 拟下发群: %s", inserted_id, route_result.wxids[i]);
@@ -1362,7 +1368,7 @@ static void flush_incomplete_pending_sms(PendingSMS *node) {
             snprintf(final_msg, strlen(utf8) + 96,
                      "[PARTIAL %d/%d] %s",
                      node->arrived_count, node->total_parts, utf8);
-            dispatch_decoded_sms(node->sender, node->ref_num, node->is_16bit_ref, final_msg);
+            dispatch_decoded_sms(node->sender, node->ref_num, node->is_16bit_ref, final_msg, -2);
             free(final_msg);
         }
     }
@@ -1394,7 +1400,7 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
         }
 
         if (success) {
-            dispatch_decoded_sms(frame->sender, 0, false, utf8_buf);
+            dispatch_decoded_sms(frame->sender, 0, false, utf8_buf, 0);
             char sql[128]; 
             snprintf(sql, sizeof(sql), "UPDATE raw_sms SET status=1 WHERE id=%d", raw_table_id); 
             if (db_query_with_reconnect(&mysql, sql, "短信状态") != 0) {
@@ -1507,7 +1513,7 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
         }
 
         if(success) {
-            dispatch_decoded_sms(target->sender, target->ref_num, target->is_16bit_ref, utf8);
+            dispatch_decoded_sms(target->sender, target->ref_num, target->is_16bit_ref, utf8, 0);
         }
         free(full); free(utf8); 
         free_pending_sms(target);
