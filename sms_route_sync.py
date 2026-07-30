@@ -315,17 +315,29 @@ def expand_register_ip_item(item: str) -> List[str]:
 def parse_sms_command(message: str) -> SmsCommand | None:
     """Parse supported SMS commands.
 
-    Supported formats:
+    Supported formats (case-insensitive command names):
         _smsRoute <nick_name>
         _smsRegister <nick_name> <ip_list>
     Notes for _smsRegister ip_list:
         Supports range shorthand in last octet, such as 10.1.2.3-8.
+    Notes for _smsRoute nick_name:
+        Treat everything after command name as one nick_name, so spaces are allowed.
     """
     if not message:
         LOGGER.debug("SMS command parse skipped: empty message")
         return None
     text = message.strip()
-    if not (text.startswith("_smsRoute ") or text.startswith("_smsRegister ")):
+
+    route_match = re.match(r"(?i)^_smsroute(?:\s+(.+))?$", text)
+    if route_match:
+        nick_name = (route_match.group(1) or "").strip()
+        if not nick_name:
+            LOGGER.warning("_smsRoute parse failed: empty nick_name message=%r", message)
+            return None
+        LOGGER.info("Parsed SMS command: kind=route nick_name=%s", nick_name)
+        return SmsCommand(kind="route", nick_name=nick_name, ip_list=[])
+
+    if not re.match(r"(?i)^_smsregister(?:\s|$)", text):
         LOGGER.debug("SMS command parse skipped: unsupported prefix message=%r", message)
         return None
 
@@ -337,19 +349,8 @@ def parse_sms_command(message: str) -> SmsCommand | None:
 
     LOGGER.debug("SMS command tokenized: parts=%r", parts)
 
-    command = parts[0]
-    if command == "_smsRoute":
-        if len(parts) != 2:
-            LOGGER.warning("_smsRoute parse failed: expected 2 parts actual=%d message=%r", len(parts), message)
-            return None
-        nick_name = parts[1].strip()
-        if not nick_name:
-            LOGGER.warning("_smsRoute parse failed: empty nick_name message=%r", message)
-            return None
-        LOGGER.info("Parsed SMS command: kind=route nick_name=%s", nick_name)
-        return SmsCommand(kind="route", nick_name=nick_name, ip_list=[])
-
-    if command == "_smsRegister":
+    command = parts[0].lower() if parts else ""
+    if command == "_smsregister":
         if len(parts) < 3:
             LOGGER.warning("_smsRegister parse failed: insufficient parts actual=%d message=%r", len(parts), message)
             return None
