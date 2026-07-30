@@ -551,18 +551,90 @@ def lookup_chatroom_wxid(api_url: str, nick_name: str, timeout: float) -> str:
         len(nickname_hex),
         nickname_hex,
     )
-    sql = (
+    hex_sql = (
         "SELECT UserName AS wxid, NickName "
         "FROM Contact "
         f"WHERE Type=2 AND hex(NickName)='{nickname_hex}' "
         "LIMIT 1"
     )
-    LOGGER.debug("Chatroom lookup SQL prepared: %s", sql)
-    result = http_exec_sql(api_url=api_url, db_name="MicroMsg.db", sql=sql, timeout=timeout)
+    literal_sql = (
+        "SELECT UserName AS wxid, NickName "
+        "FROM Contact "
+        f"WHERE Type=2 AND NickName='{quote_sql(nick_name)}' "
+        "LIMIT 1"
+    )
+
+    LOGGER.debug("Chatroom lookup SQL prepared [hex_exact]: %s", hex_sql)
+    result = http_exec_sql(api_url=api_url, db_name="MicroMsg.db", sql=hex_sql, timeout=timeout)
     wxid = extract_wxid(result)
+    if wxid:
+        LOGGER.info("Chatroom lookup matched by strategy=hex_exact")
+        LOGGER.info("Chatroom wxid lookup succeeded via execSql: nick_name=%s wxid=%s", nick_name, wxid)
+        return wxid
+
+    LOGGER.warning(
+        "Chatroom lookup miss by strategy=hex_exact. response=%r. Trying strategy=literal_exact",
+        result,
+    )
+    LOGGER.debug("Chatroom lookup SQL prepared [literal_exact]: %s", literal_sql)
+    literal_result = http_exec_sql(
+        api_url=api_url,
+        db_name="MicroMsg.db",
+        sql=literal_sql,
+        timeout=timeout,
+    )
+    wxid = extract_wxid(literal_result)
+    if wxid:
+        LOGGER.info("Chatroom lookup matched by strategy=literal_exact")
+        LOGGER.info("Chatroom wxid lookup succeeded via execSql: nick_name=%s wxid=%s", nick_name, wxid)
+        return wxid
+
+    # Probe and candidate diagnostics to distinguish SQL-execution failures from no-match cases.
+    probe_sql = "SELECT 1 AS ok"
+    LOGGER.debug("Chatroom lookup diagnostic SQL [probe]: %s", probe_sql)
+    probe_result = http_exec_sql(
+        api_url=api_url,
+        db_name="MicroMsg.db",
+        sql=probe_sql,
+        timeout=timeout,
+    )
+
+    # Candidate scan uses whitespace-insensitive LIKE matching to surface nearby nicknames.
+    compact_nickname = re.sub(r"\s+", "", nick_name)
+    candidate_sql = (
+        "SELECT UserName AS wxid, NickName, hex(NickName) AS nickname_hex, length(NickName) AS nickname_len "
+        "FROM Contact "
+        "WHERE Type=2 "
+        f"AND replace(NickName, ' ', '') LIKE '%{quote_sql(compact_nickname)}%' "
+        "LIMIT 10"
+    )
+    LOGGER.debug("Chatroom lookup diagnostic SQL [candidate_scan]: %s", candidate_sql)
+    candidate_result = http_exec_sql(
+        api_url=api_url,
+        db_name="MicroMsg.db",
+        sql=candidate_sql,
+        timeout=timeout,
+    )
+
+    LOGGER.warning(
+        (
+            "Chatroom lookup failed after strategies. nick_name=%r "
+            "hex_exact_response=%r literal_exact_response=%r probe_response=%r candidate_response=%r"
+        ),
+        nick_name,
+        result,
+        literal_result,
+        probe_result,
+        candidate_result,
+    )
     if not wxid:
-        raise RuntimeError(f"No wxid found for nick_name='{nick_name}'. API result: {result}")
-    LOGGER.info("Chatroom wxid lookup succeeded via execSql: nick_name=%s wxid=%s", nick_name, wxid)
+        raise RuntimeError(
+            (
+                "No wxid found for nick_name=%r. "
+                "hex_exact=%r literal_exact=%r probe=%r candidate=%r"
+            )
+            % (nick_name, result, literal_result, probe_result, candidate_result)
+        )
     return wxid
 
 
