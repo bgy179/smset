@@ -322,15 +322,17 @@ def parse_sms_command(message: str) -> SmsCommand | None:
         Supports range shorthand in last octet, such as 10.1.2.3-8.
     Notes for _smsRoute nick_name:
         Treat everything after command name as one nick_name, so spaces are allowed.
+        Leading and trailing spaces are discarded.
     """
     if not message:
         LOGGER.debug("SMS command parse skipped: empty message")
         return None
     text = message.strip()
 
-    route_match = re.match(r"(?i)^_smsroute(?:\s+(.+))?$", text)
+    route_match = re.match(r"(?i)^_smsroute(?:\s+(.*))?$", text)
     if route_match:
-        nick_name = (route_match.group(1) or "").strip()
+        raw_nick_name = route_match.group(1) or ""
+        nick_name = raw_nick_name.strip()
         if not nick_name:
             LOGGER.warning("_smsRoute parse failed: empty nick_name message=%r", message)
             return None
