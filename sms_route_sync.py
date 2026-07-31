@@ -297,26 +297,57 @@ def expand_register_ip_item(item: str) -> List[str]:
 
     Supports:
     - single token, e.g. "10.1.2.3"
-    - last-octet range, e.g. "10.1.2.3-8" -> 10.1.2.3..10.1.2.8
+    - ipcompress suffix expression, e.g. "10.1.2.1+3-5+9" (includes "10.1.2.3-8")
     """
     token = item.strip()
     if not token:
         return []
 
-    match = re.fullmatch(r"(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})-(\d{1,3})", token)
+    match = re.fullmatch(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.([\d+-]+)", token)
     if not match:
         return [token]
 
-    prefix = match.group(1)
-    start = int(match.group(2))
-    end = int(match.group(3))
-
-    if start > 255 or end > 255 or start > end:
-        LOGGER.warning("_smsRegister parse failed: invalid IP range token=%s", token)
+    prefix_parts = [int(match.group(1)), int(match.group(2)), int(match.group(3))]
+    if any(part > 255 for part in prefix_parts):
+        LOGGER.warning("_smsRegister parse failed: invalid IP prefix token=%s", token)
         return []
 
-    expanded = [f"{prefix}.{value}" for value in range(start, end + 1)]
-    LOGGER.debug("Expanded register IP range token=%s to count=%d", token, len(expanded))
+    expression = match.group(4)
+    last_octets: List[int] = []
+    seen_octets: Set[int] = set()
+
+    try:
+        for part in expression.split("+"):
+            section = part.strip()
+            if not section:
+                raise ValueError("empty section")
+
+            if "-" in section:
+                bounds = section.split("-")
+                if len(bounds) != 2:
+                    raise ValueError("invalid range section")
+                start = int(bounds[0])
+                end = int(bounds[1])
+                if start < 0 or end < 0 or start > 255 or end > 255 or start > end:
+                    raise ValueError("range out of bounds")
+                for value in range(start, end + 1):
+                    if value not in seen_octets:
+                        seen_octets.add(value)
+                        last_octets.append(value)
+            else:
+                value = int(section)
+                if value < 0 or value > 255:
+                    raise ValueError("octet out of bounds")
+                if value not in seen_octets:
+                    seen_octets.add(value)
+                    last_octets.append(value)
+    except ValueError:
+        LOGGER.warning("_smsRegister parse failed: invalid compressed IP token=%s", token)
+        return []
+
+    prefix = f"{prefix_parts[0]}.{prefix_parts[1]}.{prefix_parts[2]}"
+    expanded = [f"{prefix}.{value}" for value in last_octets]
+    LOGGER.debug("Expanded register IP token=%s to count=%d", token, len(expanded))
     return expanded
 
 
@@ -327,7 +358,8 @@ def parse_sms_command(message: str) -> SmsCommand | None:
         _smsRoute <nick_name>
         _smsRegister <nick_name> <ip_list>
     Notes for _smsRegister ip_list:
-        Supports range shorthand in last octet, such as 10.1.2.3-8.
+        Supports ipcompress format, such as 10.1.2.1+3-5+9.
+        Last-octet shorthand like 10.1.2.3-8 is treated as the same suffix expression format.
     Notes for _smsRoute nick_name:
         Treat everything after command name as one nick_name, so spaces are allowed.
         Leading and trailing spaces are discarded.
