@@ -1,6 +1,6 @@
 /********
  * 编译说明 (Windows MinGW / MSYS2 环境下):
- * gcc sms_wechat_router_gateway.c -o sms_wechat_router_gateway.exe -I./mysql/include -I./curl/include -L./mysql/lib -L./curl/lib -lmysql -lcurl -lws2_32 -lpthread -lregex
+ * gcc sms2wechat-v7.c sms_route_command.c -o sms2wechat-v7.exe -I./mysql/include -I./curl/include -L./mysql/lib -L./curl/lib -lmysql -lcurl -lws2_32 -lpthread -lregex
  ********/
 
 #define _XOPEN_SOURCE 700
@@ -18,6 +18,9 @@
 
 #include <mysql/mysql.h>
 #include <curl/curl.h>
+#define JSMN_STATIC
+#include "jsmn.h"
+#include "sms_route_command.h"
 
 // ===================== 配置区 =====================
 #define SERVICE_NAME_A     "SmsWechatRouterGateway"
@@ -43,6 +46,7 @@
 #define AT_TEST_TIMEOUT    400
 
 #define DEFAULT_WECHAT_SEND_API_URL  "http://127.0.0.1:8080/api/sendtxtmsg"
+#define DEFAULT_WECHAT_EXEC_SQL_URL  "http://127.0.0.1:8080/api/execSql"
 #define DEFAULT_FALLBACK_WXID        "21167291234@chatroom"
 #define DEFAULT_DB_HOST              "127.0.0.1"
 #define DEFAULT_DB_USER              "root"
@@ -51,6 +55,10 @@
 #define DEFAULT_LOG_PATH             ".\\sms_service.log"
 #define DEFAULT_CACHE_REFRESH_INTERVAL_SEC 300
 #define DEFAULT_SEGMENT_TIMEOUT_SEC 120
+#define DEFAULT_COMMAND_INTERVAL_SEC 60
+#define DEFAULT_COMMAND_BATCH_SIZE 100
+#define DEFAULT_COMMAND_HTTP_TIMEOUT_SEC 5
+#define DEFAULT_CHATROOM_TYPE "【中国移动磐基PaaS平台】zabbix 监控"
 
 // ===================== 数据结构定义 =====================
 typedef struct {
@@ -114,6 +122,7 @@ typedef struct {
 
 typedef struct {
     char wechat_send_api_url[256];
+    char wechat_exec_sql_url[256];
     char fallback_wxid[128];
     char db_host[128];
     char db_user[64];
@@ -122,6 +131,11 @@ typedef struct {
     char log_path[260];
     int cache_refresh_interval_sec;
     int segment_timeout_sec;
+    char allowed_senders[1024];
+    int command_interval_sec;
+    int command_batch_size;
+    int command_http_timeout_sec;
+    char chatroom_type[256];
 } AppConfig;
 
 // ===================== 全局变量 =====================
@@ -141,11 +155,17 @@ static hash_table_t *g_cache = NULL;
 static pthread_rwlock_t g_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
 static AppConfig g_cfg;
 static char g_exe_dir[MAX_PATH] = {0};
+static pthread_t g_push_thread;
+static pthread_t g_command_thread;
+static bool g_push_thread_started = false;
+static bool g_command_thread_started = false;
+static HANDLE g_cache_thread = NULL;
 
 void WriteLog(const char* fmt, ...);
 
 static void config_set_defaults(void) {
     snprintf(g_cfg.wechat_send_api_url, sizeof(g_cfg.wechat_send_api_url), "%s", DEFAULT_WECHAT_SEND_API_URL);
+    snprintf(g_cfg.wechat_exec_sql_url, sizeof(g_cfg.wechat_exec_sql_url), "%s", DEFAULT_WECHAT_EXEC_SQL_URL);
     snprintf(g_cfg.fallback_wxid, sizeof(g_cfg.fallback_wxid), "%s", DEFAULT_FALLBACK_WXID);
     snprintf(g_cfg.db_host, sizeof(g_cfg.db_host), "%s", DEFAULT_DB_HOST);
     snprintf(g_cfg.db_user, sizeof(g_cfg.db_user), "%s", DEFAULT_DB_USER);
@@ -154,6 +174,11 @@ static void config_set_defaults(void) {
     snprintf(g_cfg.log_path, sizeof(g_cfg.log_path), "%s", DEFAULT_LOG_PATH);
     g_cfg.cache_refresh_interval_sec = DEFAULT_CACHE_REFRESH_INTERVAL_SEC;
     g_cfg.segment_timeout_sec = DEFAULT_SEGMENT_TIMEOUT_SEC;
+    g_cfg.allowed_senders[0] = '\0';
+    g_cfg.command_interval_sec = DEFAULT_COMMAND_INTERVAL_SEC;
+    g_cfg.command_batch_size = DEFAULT_COMMAND_BATCH_SIZE;
+    g_cfg.command_http_timeout_sec = DEFAULT_COMMAND_HTTP_TIMEOUT_SEC;
+    snprintf(g_cfg.chatroom_type, sizeof(g_cfg.chatroom_type), "%s", DEFAULT_CHATROOM_TYPE);
 }
 
 static void init_exe_dir(void) {
@@ -195,6 +220,8 @@ static void config_apply_kv(const char *key, const char *value) {
 
     if (_stricmp(key, "WECHAT_SEND_API_URL") == 0) {
         snprintf(g_cfg.wechat_send_api_url, sizeof(g_cfg.wechat_send_api_url), "%s", value);
+    } else if (_stricmp(key, "WECHAT_EXEC_SQL_URL") == 0) {
+        snprintf(g_cfg.wechat_exec_sql_url, sizeof(g_cfg.wechat_exec_sql_url), "%s", value);
     } else if (_stricmp(key, "FALLBACK_WXID") == 0) {
         snprintf(g_cfg.fallback_wxid, sizeof(g_cfg.fallback_wxid), "%s", value);
     } else if (_stricmp(key, "DB_HOST") == 0) {
@@ -213,6 +240,20 @@ static void config_apply_kv(const char *key, const char *value) {
     } else if (_stricmp(key, "SEGMENT_TIMEOUT_SEC") == 0) {
         int sec = atoi(value);
         if (sec > 0) g_cfg.segment_timeout_sec = sec;
+    } else if (_stricmp(key, "ALLOWED_SENDERS") == 0) {
+        snprintf(g_cfg.allowed_senders, sizeof(g_cfg.allowed_senders), "%s", value);
+    } else if (_stricmp(key, "COMMAND_INTERVAL_SEC") == 0 ||
+               _stricmp(key, "INTERVAL_SECONDS") == 0) {
+        int sec = atoi(value);
+        if (sec > 0) g_cfg.command_interval_sec = sec;
+    } else if (_stricmp(key, "COMMAND_BATCH_SIZE") == 0) {
+        int count = atoi(value);
+        if (count > 0) g_cfg.command_batch_size = count;
+    } else if (_stricmp(key, "COMMAND_HTTP_TIMEOUT_SEC") == 0) {
+        int sec = atoi(value);
+        if (sec > 0) g_cfg.command_http_timeout_sec = sec;
+    } else if (_stricmp(key, "CHATROOM_TYPE") == 0) {
+        snprintf(g_cfg.chatroom_type, sizeof(g_cfg.chatroom_type), "%s", value);
     }
 }
 
@@ -824,9 +865,15 @@ DWORD WINAPI CacheRefreshThreadProc(LPVOID lpParam) {
     (void)lpParam;
     WriteLog("[后台线程] 5分钟定期路由全量刷新线程挂载就绪");
     for (;;) {
-        Sleep((DWORD)g_cfg.cache_refresh_interval_sec * 1000);
+        DWORD wait_ms = (DWORD)g_cfg.cache_refresh_interval_sec * 1000;
+        if (g_hStopEvent &&
+            WaitForSingleObject(g_hStopEvent, wait_ms) == WAIT_OBJECT_0) {
+            break;
+        }
+        if (!g_hStopEvent) Sleep(wait_ms);
         cache_full_refresh();
     }
+    WriteLog("[后台线程] 路由缓存刷新线程已停止");
     return 0;
 }
 
@@ -953,6 +1000,390 @@ static int send_wechat_message(const char *wxid, const char *content) {
     free(resp_data.buffer); return ret_status;
 }
 
+static int post_json_request(const char *url, const char *body, int timeout_sec,
+                             ResponseData *response) {
+    CURL *curl = curl_easy_init();
+    if (!curl || !url || !body || !response) return -1;
+
+    response->buffer = malloc(RESP_BUF_INIT_SIZE);
+    response->len = 0;
+    if (!response->buffer) {
+        curl_easy_cleanup(curl);
+        return -1;
+    }
+    response->buffer[0] = '\0';
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json; charset=utf-8");
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_sec);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK || http_code < 200 || http_code >= 300) {
+        WriteLog("[命令HTTP] 请求失败 CURL=%d HTTP=%ld URL=%s",
+                 (int)rc, http_code, url);
+        free(response->buffer);
+        response->buffer = NULL;
+        response->len = 0;
+        return -1;
+    }
+    return 0;
+}
+
+static int json_string_value(const char *json, const char *key,
+                             char *output, size_t output_size) {
+    jsmn_parser parser;
+    jsmntok_t tokens[128];
+    if (!json || !key || !output || output_size == 0) return -1;
+
+    jsmn_init(&parser);
+    int token_count = jsmn_parse(&parser, json, strlen(json), tokens,
+                                 sizeof(tokens) / sizeof(tokens[0]));
+    if (token_count < 2) return -1;
+
+    size_t key_length = strlen(key);
+    for (int i = 1; i + 1 < token_count; i++) {
+        jsmntok_t *candidate = &tokens[i];
+        if (candidate->type != JSMN_STRING ||
+            (size_t)(candidate->end - candidate->start) != key_length ||
+            strncmp(json + candidate->start, key, key_length) != 0) {
+            continue;
+        }
+        jsmntok_t *value = &tokens[i + 1];
+        if (value->type != JSMN_STRING) return -1;
+        size_t length = (size_t)(value->end - value->start);
+        if (length >= output_size) return -1;
+        memcpy(output, json + value->start, length);
+        output[length] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+static int lookup_chatroom_wxid(const char *nickname, char *wxid, size_t wxid_size) {
+    char nickname_hex[SMS_ROUTE_NICKNAME_MAX * 2 + 1];
+    const unsigned char *bytes = (const unsigned char *)nickname;
+    for (size_t i = 0; i < strlen(nickname); i++) {
+        snprintf(nickname_hex + i * 2, 3, "%02X", bytes[i]);
+    }
+    nickname_hex[strlen(nickname) * 2] = '\0';
+
+    char sql[sizeof(nickname_hex) + 256];
+    snprintf(sql, sizeof(sql),
+             "SELECT UserName AS wxid, NickName FROM Contact "
+             "WHERE Type=2 AND hex(NickName)='%s' LIMIT 1",
+             nickname_hex);
+
+    char escaped_sql[sizeof(sql) * 2 + 1];
+    json_escape_string(sql, escaped_sql, sizeof(escaped_sql));
+    char body[sizeof(escaped_sql) + 128];
+    snprintf(body, sizeof(body),
+             "{\"dbName\":\"MicroMsg.db\",\"sql\":\"%s\"}", escaped_sql);
+
+    ResponseData response = {0};
+    if (post_json_request(g_cfg.wechat_exec_sql_url, body,
+                          g_cfg.command_http_timeout_sec, &response) != 0) {
+        return -1;
+    }
+
+    char success[32] = {0};
+    int result = json_string_value(response.buffer, "msg", success, sizeof(success));
+    if (result != 0 || strcmp(success, "success") != 0 ||
+        json_string_value(response.buffer, "wxid", wxid, wxid_size) != 0) {
+        WriteLog("[命令路由] 微信群查询返回无法识别的结果: %s", response.buffer);
+        result = -1;
+    } else {
+        WriteLog("[命令路由] 微信群查询成功 nickname=%s wxid=%s", nickname, wxid);
+    }
+    free(response.buffer);
+    return result;
+}
+
+static int send_wechat_plain_message(const char *wxid, const char *content) {
+    char escaped_wxid[300];
+    char escaped_content[4096];
+    json_escape_string(wxid, escaped_wxid, sizeof(escaped_wxid));
+    json_escape_string(content, escaped_content, sizeof(escaped_content));
+
+    char body[8192];
+    snprintf(body, sizeof(body),
+             "{\"wxid\":\"%s\",\"content\":\"%s\"}",
+             escaped_wxid, escaped_content);
+
+    ResponseData response = {0};
+    int result = post_json_request(g_cfg.wechat_send_api_url, body,
+                                   g_cfg.command_http_timeout_sec, &response);
+    if (result == 0) {
+        char message[32] = {0};
+        if (json_string_value(response.buffer, "msg", message, sizeof(message)) != 0 ||
+            strcmp(message, "success") != 0) {
+            WriteLog("[命令HTTP] 微信接口未返回 success: %s", response.buffer);
+            result = -1;
+        }
+        free(response.buffer);
+    }
+    return result;
+}
+
+static int mysql_execute_prepared(MYSQL *conn, const char *sql,
+                                 MYSQL_BIND *params, unsigned int param_count) {
+    MYSQL_STMT *stmt = mysql_stmt_init(conn);
+    if (!stmt) return -1;
+    int result = -1;
+
+    if (mysql_stmt_prepare(stmt, sql, strlen(sql)) == 0 &&
+        mysql_stmt_bind_param(stmt, params) == 0 &&
+        mysql_stmt_execute(stmt) == 0) {
+        result = 0;
+    } else {
+        WriteLog("[命令数据库] 预编译执行失败，错误=%s", mysql_stmt_error(stmt));
+    }
+    (void)param_count;
+    mysql_stmt_close(stmt);
+    return result;
+}
+
+static void mysql_string_bind(MYSQL_BIND *bind, char *value) {
+    memset(bind, 0, sizeof(*bind));
+    bind->buffer_type = MYSQL_TYPE_STRING;
+    bind->buffer = value;
+    bind->buffer_length = (unsigned long)strlen(value);
+}
+
+static int lookup_single_string_by_param(MYSQL *conn, const char *sql,
+                                         const char *param,
+                                         char *output, size_t output_size) {
+    MYSQL_STMT *stmt = mysql_stmt_init(conn);
+    MYSQL_BIND params[1];
+    MYSQL_BIND results[1];
+    unsigned long result_length = 0;
+
+    mysql_string_bind(&params[0], (char *)param);
+    if (!stmt || mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0 ||
+        mysql_stmt_bind_param(stmt, params) != 0) {
+        if (stmt) {
+            WriteLog("[命令数据库] 单值查询预编译失败，错误=%s", mysql_stmt_error(stmt));
+            mysql_stmt_close(stmt);
+        }
+        return -1;
+    }
+
+    memset(results, 0, sizeof(results));
+    results[0].buffer_type = MYSQL_TYPE_STRING;
+    results[0].buffer = output;
+    results[0].buffer_length = (unsigned long)output_size - 1;
+    results[0].length = &result_length;
+
+    int result = -1;
+    if (mysql_stmt_execute(stmt) == 0 &&
+        mysql_stmt_bind_result(stmt, results) == 0 &&
+        mysql_stmt_store_result(stmt) == 0 &&
+        mysql_stmt_fetch(stmt) == 0) {
+        size_t length = result_length < output_size - 1 ? result_length : output_size - 1;
+        output[length] = '\0';
+        result = 0;
+    } else {
+        WriteLog("[命令数据库] 单值查询未返回数据");
+    }
+    mysql_stmt_close(stmt);
+    return result;
+}
+
+static int lookup_local_chatroom_wxid(MYSQL *conn, const char *nickname,
+                                      char *wxid, size_t wxid_size) {
+    const char *sql =
+        "SELECT wxid FROM wzwmonitor.wechat_chatroom "
+        "WHERE nickname=? LIMIT 1";
+    return lookup_single_string_by_param(conn, sql, nickname, wxid, wxid_size);
+}
+
+static int upsert_chatroom(MYSQL *conn, const char *wxid, const char *nickname) {
+    char mutable_wxid[128];
+    char mutable_nickname[SMS_ROUTE_NICKNAME_MAX];
+    char mutable_type[256];
+    char old_tenant[128] = {0};
+    const char *select_tenant =
+        "SELECT tenantname FROM wzwmonitor.wechat_chatroom "
+        "WHERE wxid=? LIMIT 1";
+    int had_old_tenant =
+        lookup_single_string_by_param(conn, select_tenant, wxid,
+                                      old_tenant, sizeof(old_tenant)) == 0;
+    snprintf(mutable_wxid, sizeof(mutable_wxid), "%s", wxid);
+    snprintf(mutable_nickname, sizeof(mutable_nickname), "%s", nickname);
+    snprintf(mutable_type, sizeof(mutable_type), "%s", g_cfg.chatroom_type);
+
+    MYSQL_BIND params[4];
+    mysql_string_bind(&params[0], mutable_wxid);
+    mysql_string_bind(&params[1], mutable_nickname);
+    mysql_string_bind(&params[2], mutable_type);
+    mysql_string_bind(&params[3], mutable_wxid);
+
+    const char *upsert =
+        "INSERT INTO wzwmonitor.wechat_chatroom "
+        "(wxid,nickname,chatroom_type,tenantname) VALUES (?,?,?,?) "
+        "ON DUPLICATE KEY UPDATE nickname=VALUES(nickname),"
+        "chatroom_type=VALUES(chatroom_type),tenantname=VALUES(tenantname),"
+        "update_time=CURRENT_TIMESTAMP";
+    if (mysql_execute_prepared(conn, upsert, params, 4) != 0) return -1;
+
+    if (had_old_tenant && strcmp(old_tenant, wxid) != 0) {
+        char new_tenant[128];
+        snprintf(new_tenant, sizeof(new_tenant), "%s", wxid);
+        MYSQL_BIND sync_params[2];
+        mysql_string_bind(&sync_params[0], new_tenant);
+        mysql_string_bind(&sync_params[1], old_tenant);
+        const char *sync_sql =
+            "UPDATE wzwmonitor.paas_cluster_tenantname_ip "
+            "SET tenantname=? WHERE tenantname=?";
+        if (mysql_execute_prepared(conn, sync_sql, sync_params, 2) != 0) return -1;
+        WriteLog("[命令路由] 已同步 tenantname %s -> %s", old_tenant, wxid);
+    }
+    return 0;
+}
+
+static int insert_tenant_ips(MYSQL *conn, const char *wxid,
+                             const struct sms_route_command *command) {
+    const char *sql =
+        "INSERT INTO wzwmonitor.paas_cluster_tenantname_ip "
+        "(tenantname,clustername,tenantip) VALUES (?,?,?)";
+    for (size_t i = 0; i < command->ip_count; i++) {
+        char tenant[128];
+        char ip[SMS_ROUTE_IP_TEXT_MAX];
+        MYSQL_BIND params[3];
+        snprintf(tenant, sizeof(tenant), "%s", wxid);
+        snprintf(ip, sizeof(ip), "%s", command->ips[i]);
+        mysql_string_bind(&params[0], tenant);
+        mysql_string_bind(&params[1], tenant);
+        mysql_string_bind(&params[2], ip);
+        if (mysql_execute_prepared(conn, sql, params, 3) != 0) return -1;
+    }
+    return 0;
+}
+
+static int update_decoded_sms_status(MYSQL *conn, int row_id, int status) {
+    const char *sql =
+        "UPDATE zbxalerts.decoded_sms SET send_status=? WHERE id=?";
+    MYSQL_BIND params[2];
+    memset(params, 0, sizeof(params));
+    params[0].buffer_type = MYSQL_TYPE_LONG;
+    params[0].buffer = &status;
+    params[0].is_unsigned = 0;
+    params[1].buffer_type = MYSQL_TYPE_LONG;
+    params[1].buffer = &row_id;
+    params[1].is_unsigned = 0;
+    return mysql_execute_prepared(conn, sql, params, 2);
+}
+
+static int process_command_row(MYSQL *conn, int row_id,
+                               const char *sender, const char *message) {
+    struct sms_route_command command;
+    enum sms_route_command_type command_type =
+        sms_route_command_parse(message, &command);
+
+    const char *claim_sql =
+        "UPDATE zbxalerts.decoded_sms SET send_status=-10 "
+        "WHERE id=? AND send_status=0";
+    MYSQL_STMT *claim_stmt = mysql_stmt_init(conn);
+    MYSQL_BIND claim_params[1];
+    memset(claim_params, 0, sizeof(claim_params));
+    claim_params[0].buffer_type = MYSQL_TYPE_LONG;
+    claim_params[0].buffer = &row_id;
+    if (!claim_stmt ||
+        mysql_stmt_prepare(claim_stmt, claim_sql, strlen(claim_sql)) != 0 ||
+        mysql_stmt_bind_param(claim_stmt, claim_params) != 0 ||
+        mysql_stmt_execute(claim_stmt) != 0 ||
+        mysql_stmt_affected_rows(claim_stmt) != 1) {
+        if (claim_stmt) mysql_stmt_close(claim_stmt);
+        return 1;
+    }
+    mysql_stmt_close(claim_stmt);
+
+    if (command_type == SMS_ROUTE_COMMAND_NONE) {
+        return update_decoded_sms_status(conn, row_id, -3);
+    }
+    if (command_type == SMS_ROUTE_COMMAND_INVALID ||
+        !sms_route_sender_allowed(sender, g_cfg.allowed_senders)) {
+        return update_decoded_sms_status(conn, row_id, -1);
+    }
+
+    char wxid[128] = {0};
+    if (command_type == SMS_ROUTE_COMMAND_ROUTE) {
+        if (lookup_chatroom_wxid(command.nickname, wxid, sizeof(wxid)) != 0) {
+            update_decoded_sms_status(conn, row_id, -1);
+            return -1;
+        }
+    } else if (lookup_local_chatroom_wxid(conn, command.nickname,
+                                           wxid, sizeof(wxid)) != 0) {
+        update_decoded_sms_status(conn, row_id, -1);
+        return -1;
+    }
+
+    if (mysql_autocommit(conn, 0) != 0) {
+        WriteLog("[命令处理] 无法开启事务 row_id=%d error=%s",
+                 row_id, mysql_error(conn));
+        update_decoded_sms_status(conn, row_id, -1);
+        return -1;
+    }
+    int operation_result = command_type == SMS_ROUTE_COMMAND_ROUTE
+        ? upsert_chatroom(conn, wxid, command.nickname)
+        : insert_tenant_ips(conn, wxid, &command);
+
+    char confirmation[4096];
+    if (operation_result == 0) {
+        if (command_type == SMS_ROUTE_COMMAND_ROUTE) {
+            snprintf(confirmation, sizeof(confirmation),
+                     "Route to this group built. Group wxid is %s", wxid);
+        } else {
+            size_t used = (size_t)snprintf(
+                confirmation, sizeof(confirmation),
+                "_smsRegister succeeded. inserted %zu IPs: ",
+                command.ip_count);
+            for (size_t i = 0; i < command.ip_count && used < sizeof(confirmation); i++) {
+                int written = snprintf(
+                    confirmation + used, sizeof(confirmation) - used,
+                    i == 0 ? "%s" : ", %s", command.ips[i]);
+                if (written < 0) break;
+                size_t step = (size_t)written;
+                if (step >= sizeof(confirmation) - used) {
+                    used = sizeof(confirmation) - 1;
+                    break;
+                }
+                used += step;
+            }
+        }
+        operation_result = send_wechat_plain_message(wxid, confirmation);
+    }
+
+    if (operation_result == 0 &&
+        update_decoded_sms_status(conn, row_id, 1) == 0) {
+        if (mysql_commit(conn) == 0) {
+            mysql_autocommit(conn, 1);
+            WriteLog("[命令处理] 成功 row_id=%d type=%d nickname=%s",
+                     row_id, command_type, command.nickname);
+            return 0;
+        }
+        WriteLog("[命令处理] 提交失败 row_id=%d error=%s",
+                 row_id, mysql_error(conn));
+    }
+
+    mysql_rollback(conn);
+    mysql_autocommit(conn, 1);
+    update_decoded_sms_status(conn, row_id, -1);
+    WriteLog("[命令处理] 失败 row_id=%d type=%d nickname=%s",
+             row_id, command_type, command.nickname);
+    return -1;
+}
+
 // ===================== 核心分发：纯异步落库 =====================
 void dispatch_decoded_sms(const char *sender, uint16_t ref_num, bool is_16bit, const char *content_utf8, int initial_send_status) {
     char ip[64];
@@ -985,6 +1416,115 @@ void dispatch_decoded_sms(const char *sender, uint16_t ref_num, bool is_16bit, c
     }
 }
 
+static int build_allowed_sender_filter(MYSQL *conn, char *output, size_t output_size) {
+    if (!conn || !output || output_size == 0 || g_cfg.allowed_senders[0] == '\0') {
+        return -1;
+    }
+
+    char configured[sizeof(g_cfg.allowed_senders)];
+    snprintf(configured, sizeof(configured), "%s", g_cfg.allowed_senders);
+    size_t used = 0;
+    char *entry = configured;
+
+    while (entry != NULL) {
+        char *separator = strchr(entry, ',');
+        if (separator) *separator = '\0';
+
+        char *value = entry;
+        while (isspace((unsigned char)*value)) value++;
+        size_t value_length = strlen(value);
+        while (value_length > 0 && isspace((unsigned char)value[value_length - 1])) {
+            value[--value_length] = '\0';
+        }
+
+        if (value_length > 0) {
+            char escaped[2048];
+            mysql_real_escape_string(conn, escaped, value, value_length);
+            int written = snprintf(output + used, output_size - used,
+                                   used == 0 ? "'%s'" : ",'%s'", escaped);
+            if (written < 0 || (size_t)written >= output_size - used) return -1;
+            used += (size_t)written;
+        }
+
+        if (!separator) break;
+        entry = separator + 1;
+    }
+    return used > 0 ? 0 : -1;
+}
+
+void* SmsCommandWorkerThreadProc(void* lpParam) {
+    (void)lpParam;
+
+    if (g_cfg.allowed_senders[0] == '\0') {
+        WriteLog("[命令处理] 未配置 ALLOWED_SENDERS，短信命令功能已禁用");
+        return NULL;
+    }
+
+    WriteLog("[命令处理] 后台线程启动 interval=%d batch=%d",
+             g_cfg.command_interval_sec, g_cfg.command_batch_size);
+    while (!(g_hStopEvent &&
+             WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0)) {
+        MYSQL *conn = db_connect();
+        if (!conn) {
+            Sleep(2000);
+            continue;
+        }
+
+        char sender_filter[4096] = {0};
+        if (build_allowed_sender_filter(conn, sender_filter, sizeof(sender_filter)) != 0) {
+            WriteLog("[命令处理] 授权号码配置为空或过长，跳过本轮");
+            mysql_close(conn);
+            Sleep((DWORD)g_cfg.command_interval_sec * 1000);
+            continue;
+        }
+
+        char recovery_query[8192];
+        snprintf(recovery_query, sizeof(recovery_query),
+                 "UPDATE zbxalerts.decoded_sms SET send_status=0 "
+                 "WHERE send_status=-10 AND receive_time < DATE_SUB(NOW(), INTERVAL 10 MINUTE) "
+                 "AND sender IN (%s)",
+                 sender_filter);
+        db_query_with_reconnect(&conn, recovery_query, "命令恢复");
+
+        char query[8192];
+        snprintf(query, sizeof(query),
+                 "SELECT id,sender,message_content FROM zbxalerts.decoded_sms "
+                 "WHERE send_status=0 AND sender IN (%s) "
+                 "AND (LOCATE('_smsRoute', LTRIM(message_content))=1 "
+                 "OR LOCATE('_smsRegister', LTRIM(message_content))=1) "
+                 "ORDER BY id ASC LIMIT %d",
+                 sender_filter, g_cfg.command_batch_size);
+
+        if (db_query_with_reconnect(&conn, query, "命令处理") == 0) {
+            MYSQL_RES *result = mysql_store_result(conn);
+            if (result) {
+                int success_count = 0;
+                MYSQL_ROW row;
+                while ((row = mysql_fetch_row(result)) != NULL) {
+                    if (!row[0] || !row[1] || !row[2]) continue;
+                    if (process_command_row(conn, atoi(row[0]), row[1], row[2]) == 0) {
+                        success_count++;
+                    }
+                }
+                mysql_free_result(result);
+                if (success_count > 0) cache_full_refresh();
+            } else {
+                WriteLog("[命令处理] mysql_store_result 失败: %s", mysql_error(conn));
+            }
+        }
+        mysql_close(conn);
+
+        DWORD wait_ms = (DWORD)g_cfg.command_interval_sec * 1000;
+        if (g_hStopEvent &&
+            WaitForSingleObject(g_hStopEvent, wait_ms) == WAIT_OBJECT_0) {
+            break;
+        }
+        if (!g_hStopEvent) Sleep(wait_ms);
+    }
+    WriteLog("[命令处理] 后台线程已停止");
+    return NULL;
+}
+
 // ===================== 独立的后台异步微信发送线程 =====================
 void* WeChatAsyncPushThreadProc(void* lpParam) {
     (void)lpParam;
@@ -995,7 +1535,8 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
     WriteLog("[后台线程] 初始化等待完成，开始进入主消费循环");
 
     while (1) {
-        if (!g_bDebugMode && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+        if (g_hStopEvent &&
+            WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
             break;
         }
 
@@ -1007,7 +1548,12 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
         }
 
         // WriteLog("[后台线程] 扫描待发送消息队列...");
-        const char *sql = "SELECT id, target_wxid, message_content FROM decoded_sms WHERE send_status = 0 and sender = '106589665811' ORDER BY id ASC LIMIT 50;";
+        const char *sql =
+            "SELECT id, target_wxid, message_content FROM decoded_sms "
+            "WHERE send_status=0 AND sender='106589665811' "
+            "AND LOCATE('_smsRoute', LTRIM(message_content))<>1 "
+            "AND LOCATE('_smsRegister', LTRIM(message_content))<>1 "
+            "ORDER BY id ASC LIMIT 50;";
         if (db_query_with_reconnect(&async_mysql, sql, "后台线程") == 0) {
             MYSQL_RES *res = mysql_store_result(async_mysql);
             if (res) {
@@ -1858,8 +2404,11 @@ void CoreBusinessInit() {
     }
 
     WriteLog("[配置] WECHAT_SEND_API_URL=%s", g_cfg.wechat_send_api_url);
+    WriteLog("[配置] WECHAT_EXEC_SQL_URL=%s", g_cfg.wechat_exec_sql_url);
     WriteLog("[配置] FALLBACK_WXID=%s", g_cfg.fallback_wxid);
     WriteLog("[配置] DB_HOST=%s DB_NAME=%s DB_USER=%s", g_cfg.db_host, g_cfg.db_name, g_cfg.db_user);
+    WriteLog("[配置] ALLOWED_SENDERS=%s COMMAND_INTERVAL_SEC=%d COMMAND_BATCH_SIZE=%d",
+             g_cfg.allowed_senders, g_cfg.command_interval_sec, g_cfg.command_batch_size);
     WriteLog("[配置] LOG_PATH=%s CACHE_REFRESH_INTERVAL_SEC=%d SEGMENT_TIMEOUT_SEC=%d",
              g_cfg.log_path, g_cfg.cache_refresh_interval_sec, g_cfg.segment_timeout_sec);
 
@@ -1867,17 +2416,42 @@ void CoreBusinessInit() {
     WriteLog("[核心装载] 初始化事件触发：正在全量拉取MySQL本地路由映射表数据...");
     cache_full_refresh();
 
-    HANDLE hRefreshThread = CreateThread(NULL, 0, CacheRefreshThreadProc, NULL, 0, NULL);
-    if(hRefreshThread) CloseHandle(hRefreshThread);
+    g_cache_thread = CreateThread(NULL, 0, CacheRefreshThreadProc, NULL, 0, NULL);
+    if (!g_cache_thread) {
+        WriteLog("[核心装载] [严重错误] 路由缓存刷新线程挂载失败！");
+    }
     
-    pthread_t t_push;
-    if (pthread_create(&t_push, NULL, WeChatAsyncPushThreadProc, NULL) == 0) {
-        pthread_detach(t_push); 
+    if (pthread_create(&g_push_thread, NULL, WeChatAsyncPushThreadProc, NULL) == 0) {
+        g_push_thread_started = true;
     } else {
         WriteLog("[核心装载] [严重错误] 独立的 pthread 异步微信消费引擎挂载流产！");
     }
 
+    if (pthread_create(&g_command_thread, NULL, SmsCommandWorkerThreadProc, NULL) == 0) {
+        g_command_thread_started = true;
+    } else {
+        WriteLog("[核心装载] [严重错误] 短信命令消费线程挂载失败！");
+    }
+
     WriteLog("[核心装载] 所有基础设施线程均安全挂载，网关框架开始平稳接管业务。");
+}
+
+static void StopBackgroundThreads(void) {
+    if (g_hStopEvent) SetEvent(g_hStopEvent);
+
+    if (g_push_thread_started) {
+        pthread_join(g_push_thread, NULL);
+        g_push_thread_started = false;
+    }
+    if (g_command_thread_started) {
+        pthread_join(g_command_thread, NULL);
+        g_command_thread_started = false;
+    }
+    if (g_cache_thread) {
+        WaitForSingleObject(g_cache_thread, INFINITE);
+        CloseHandle(g_cache_thread);
+        g_cache_thread = NULL;
+    }
 }
 
 VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv) {
@@ -1892,6 +2466,7 @@ VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv) {
     g_ServiceStatus.dwCurrentState = SERVICE_RUNNING; SetServiceStatus(g_hStatusHandle, &g_ServiceStatus);
     ServiceWorkLoop();
     
+    StopBackgroundThreads();
     curl_global_cleanup(); if (log_fp) fclose(log_fp);
     CloseHandle(g_hStopEvent);
     g_ServiceStatus.dwCurrentState = SERVICE_STOPPED; SetServiceStatus(g_hStatusHandle, &g_ServiceStatus);
@@ -1962,10 +2537,14 @@ int main(int argc, char* argv[]) {
             printf("  正在进入控制台实时调试模式 (按下 Ctrl+C 退出)   \n");
             printf("==================================================\n");
             
+            g_hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
             CoreBusinessInit();
             ServiceWorkLoop();
-            
+
+            StopBackgroundThreads();
             curl_global_cleanup(); if (log_fp) fclose(log_fp);
+            CloseHandle(g_hStopEvent);
+            g_hStopEvent = NULL;
             return 0;
         }
 
