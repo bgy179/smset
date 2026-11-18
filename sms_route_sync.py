@@ -274,6 +274,14 @@ def quote_sql(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "''")
 
 
+def truncate_for_log(value: str, max_len: int = 800) -> str:
+    """Truncate long strings for log readability."""
+    if len(value) <= max_len:
+        return value
+    omitted = len(value) - max_len
+    return f"{value[:max_len]} ... (truncated {omitted} chars)"
+
+
 def parse_sender_whitelist(raw: str) -> Set[str]:
     """Parse comma-separated sender whitelist into a normalized set."""
     if not raw:
@@ -289,43 +297,89 @@ def expand_register_ip_item(item: str) -> List[str]:
 
     Supports:
     - single token, e.g. "10.1.2.3"
-    - last-octet range, e.g. "10.1.2.3-8" -> 10.1.2.3..10.1.2.8
+    - ipcompress suffix expression, e.g. "10.1.2.1+3-5+9" (includes "10.1.2.3-8")
     """
     token = item.strip()
     if not token:
         return []
 
-    match = re.fullmatch(r"(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})-(\d{1,3})", token)
+    match = re.fullmatch(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.([\d+-]+)", token)
     if not match:
         return [token]
 
-    prefix = match.group(1)
-    start = int(match.group(2))
-    end = int(match.group(3))
-
-    if start > 255 or end > 255 or start > end:
-        LOGGER.warning("_smsRegister parse failed: invalid IP range token=%s", token)
+    prefix_parts = [int(match.group(1)), int(match.group(2)), int(match.group(3))]
+    if any(part > 255 for part in prefix_parts):
+        LOGGER.warning("_smsRegister parse failed: invalid IP prefix token=%s", token)
         return []
 
-    expanded = [f"{prefix}.{value}" for value in range(start, end + 1)]
-    LOGGER.debug("Expanded register IP range token=%s to count=%d", token, len(expanded))
+    expression = match.group(4)
+    last_octets: List[int] = []
+    seen_octets: Set[int] = set()
+
+    try:
+        for part in expression.split("+"):
+            section = part.strip()
+            if not section:
+                raise ValueError("empty section")
+
+            if "-" in section:
+                bounds = section.split("-")
+                if len(bounds) != 2:
+                    raise ValueError("invalid range section")
+                start = int(bounds[0])
+                end = int(bounds[1])
+                if start < 0 or end < 0 or start > 255 or end > 255 or start > end:
+                    raise ValueError("range out of bounds")
+                for value in range(start, end + 1):
+                    if value not in seen_octets:
+                        seen_octets.add(value)
+                        last_octets.append(value)
+            else:
+                value = int(section)
+                if value < 0 or value > 255:
+                    raise ValueError("octet out of bounds")
+                if value not in seen_octets:
+                    seen_octets.add(value)
+                    last_octets.append(value)
+    except ValueError:
+        LOGGER.warning("_smsRegister parse failed: invalid compressed IP token=%s", token)
+        return []
+
+    prefix = f"{prefix_parts[0]}.{prefix_parts[1]}.{prefix_parts[2]}"
+    expanded = [f"{prefix}.{value}" for value in last_octets]
+    LOGGER.debug("Expanded register IP token=%s to count=%d", token, len(expanded))
     return expanded
 
 
 def parse_sms_command(message: str) -> SmsCommand | None:
     """Parse supported SMS commands.
 
-    Supported formats:
+    Supported formats (case-insensitive command names):
         _smsRoute <nick_name>
         _smsRegister <nick_name> <ip_list>
     Notes for _smsRegister ip_list:
-        Supports range shorthand in last octet, such as 10.1.2.3-8.
+        Supports ipcompress format, such as 10.1.2.1+3-5+9.
+        Last-octet shorthand like 10.1.2.3-8 is treated as the same suffix expression format.
+    Notes for _smsRoute nick_name:
+        Treat everything after command name as one nick_name, so spaces are allowed.
+        Leading and trailing spaces are discarded.
     """
     if not message:
         LOGGER.debug("SMS command parse skipped: empty message")
         return None
     text = message.strip()
-    if not (text.startswith("_smsRoute ") or text.startswith("_smsRegister ")):
+
+    route_match = re.match(r"(?i)^_smsroute(?:\s+(.*))?$", text)
+    if route_match:
+        raw_nick_name = route_match.group(1) or ""
+        nick_name = raw_nick_name.strip()
+        if not nick_name:
+            LOGGER.warning("_smsRoute parse failed: empty nick_name message=%r", message)
+            return None
+        LOGGER.info("Parsed SMS command: kind=route nick_name=%s", nick_name)
+        return SmsCommand(kind="route", nick_name=nick_name, ip_list=[])
+
+    if not re.match(r"(?i)^_smsregister(?:\s|$)", text):
         LOGGER.debug("SMS command parse skipped: unsupported prefix message=%r", message)
         return None
 
@@ -337,19 +391,8 @@ def parse_sms_command(message: str) -> SmsCommand | None:
 
     LOGGER.debug("SMS command tokenized: parts=%r", parts)
 
-    command = parts[0]
-    if command == "_smsRoute":
-        if len(parts) != 2:
-            LOGGER.warning("_smsRoute parse failed: expected 2 parts actual=%d message=%r", len(parts), message)
-            return None
-        nick_name = parts[1].strip()
-        if not nick_name:
-            LOGGER.warning("_smsRoute parse failed: empty nick_name message=%r", message)
-            return None
-        LOGGER.info("Parsed SMS command: kind=route nick_name=%s", nick_name)
-        return SmsCommand(kind="route", nick_name=nick_name, ip_list=[])
-
-    if command == "_smsRegister":
+    command = parts[0].lower() if parts else ""
+    if command == "_smsregister":
         if len(parts) < 3:
             LOGGER.warning("_smsRegister parse failed: insufficient parts actual=%d message=%r", len(parts), message)
             return None
@@ -382,11 +425,18 @@ def parse_sms_command(message: str) -> SmsCommand | None:
 
 def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
     """Call local execSql HTTP API and return parsed JSON result."""
+    started_at = time.time()
     LOGGER.info("Calling execSql API: url=%s db=%s timeout=%.2fs", api_url, db_name, timeout)
-    LOGGER.debug("execSql request SQL: %s", sql)
+    LOGGER.debug("execSql request SQL (len=%d): %s", len(sql), truncate_for_log(sql))
     payload = {"dbName": db_name, "sql": sql}
-    # Send UTF-8 JSON body and declare charset explicitly.
+    # Send UTF-8 JSON body.
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    LOGGER.debug(
+        "execSql request payload summary: db=%s sql_len=%d payload_bytes=%d",
+        db_name,
+        len(sql),
+        len(data),
+    )
  
     req = urllib.request.Request(
         api_url,
@@ -394,15 +444,58 @@ def http_exec_sql(api_url: str, db_name: str, sql: str, timeout: float) -> Any:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        LOGGER.debug("execSql HTTP response status=%s", getattr(resp, "status", "unknown"))
-        body = resp.read().decode("utf-8", errors="replace")
-    LOGGER.debug("execSql raw response body=%s", body)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", "unknown")
+            body = resp.read().decode("utf-8", errors="replace")
+        elapsed = time.time() - started_at
+        LOGGER.debug(
+            "execSql HTTP response received: status=%s elapsed=%.3fs body_len=%d",
+            status,
+            elapsed,
+            len(body),
+        )
+    except urllib.error.HTTPError as exc:
+        elapsed = time.time() - started_at
+        try:
+            error_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # pragma: no cover
+            error_body = "<failed to read HTTPError body>"
+        LOGGER.error(
+            "execSql HTTPError: code=%s reason=%s elapsed=%.3fs response_body=%s",
+            exc.code,
+            exc.reason,
+            elapsed,
+            truncate_for_log(error_body),
+        )
+        raise
+    except urllib.error.URLError as exc:
+        elapsed = time.time() - started_at
+        LOGGER.error(
+            "execSql URLError: reason=%r elapsed=%.3fs",
+            getattr(exc, "reason", exc),
+            elapsed,
+        )
+        raise
+    LOGGER.debug("execSql raw response body=%s", truncate_for_log(body))
     try:
         parsed = json.loads(body)
         LOGGER.info("execSql API call finished successfully")
+        if isinstance(parsed, dict):
+            LOGGER.debug(
+                "execSql parsed response summary: keys=%s code=%r msg=%r data_type=%s data_len=%s",
+                sorted(parsed.keys()),
+                parsed.get("code"),
+                parsed.get("msg"),
+                type(parsed.get("data")).__name__,
+                len(parsed.get("data")) if isinstance(parsed.get("data"), list) else "n/a",
+            )
         return parsed
     except json.JSONDecodeError as exc:
+        LOGGER.error(
+            "execSql JSON decode failed: body_preview=%s",
+            truncate_for_log(body),
+        )
         raise RuntimeError(f"execSql returned non-JSON response: {body[:300]}") from exc
 
 
@@ -477,19 +570,103 @@ def lookup_chatroom_wxid(api_url: str, nick_name: str, timeout: float) -> str:
     """Query WeChat DB through execSql API and resolve chatroom wxid by nickname."""
     # Use hex(NickName) matching to avoid any server-side Unicode decoding issues
     # when the SQL string contains Chinese characters.
-    nickname_hex = nick_name.encode("utf-8").hex().upper()
-    LOGGER.info("Looking up chatroom wxid via execSql: nick_name=%s nickname_hex=%s", nick_name, nickname_hex)
-    sql = (
+    nickname_bytes = nick_name.encode("utf-8")
+    nickname_hex = nickname_bytes.hex().upper()
+    LOGGER.info(
+        "Looking up chatroom wxid via execSql: nick_name=%r nick_name_len=%d utf8_bytes_len=%d",
+        nick_name,
+        len(nick_name),
+        len(nickname_bytes),
+    )
+    LOGGER.debug(
+        "Chatroom nickname hex built: hex_len=%d hex_value=%s",
+        len(nickname_hex),
+        nickname_hex,
+    )
+    hex_sql = (
         "SELECT UserName AS wxid, NickName "
         "FROM Contact "
         f"WHERE Type=2 AND hex(NickName)='{nickname_hex}' "
         "LIMIT 1"
     )
-    result = http_exec_sql(api_url=api_url, db_name="MicroMsg.db", sql=sql, timeout=timeout)
+    literal_sql = (
+        "SELECT UserName AS wxid, NickName "
+        "FROM Contact "
+        f"WHERE Type=2 AND NickName='{quote_sql(nick_name)}' "
+        "LIMIT 1"
+    )
+
+    LOGGER.debug("Chatroom lookup SQL prepared [hex_exact]: %s", hex_sql)
+    result = http_exec_sql(api_url=api_url, db_name="MicroMsg.db", sql=hex_sql, timeout=timeout)
     wxid = extract_wxid(result)
+    if wxid:
+        LOGGER.info("Chatroom lookup matched by strategy=hex_exact")
+        LOGGER.info("Chatroom wxid lookup succeeded via execSql: nick_name=%s wxid=%s", nick_name, wxid)
+        return wxid
+
+    LOGGER.warning(
+        "Chatroom lookup miss by strategy=hex_exact. response=%r. Trying strategy=literal_exact",
+        result,
+    )
+    LOGGER.debug("Chatroom lookup SQL prepared [literal_exact]: %s", literal_sql)
+    literal_result = http_exec_sql(
+        api_url=api_url,
+        db_name="MicroMsg.db",
+        sql=literal_sql,
+        timeout=timeout,
+    )
+    wxid = extract_wxid(literal_result)
+    if wxid:
+        LOGGER.info("Chatroom lookup matched by strategy=literal_exact")
+        LOGGER.info("Chatroom wxid lookup succeeded via execSql: nick_name=%s wxid=%s", nick_name, wxid)
+        return wxid
+
+    # Probe and candidate diagnostics to distinguish SQL-execution failures from no-match cases.
+    probe_sql = "SELECT 1 AS ok"
+    LOGGER.debug("Chatroom lookup diagnostic SQL [probe]: %s", probe_sql)
+    probe_result = http_exec_sql(
+        api_url=api_url,
+        db_name="MicroMsg.db",
+        sql=probe_sql,
+        timeout=timeout,
+    )
+
+    # Candidate scan uses whitespace-insensitive LIKE matching to surface nearby nicknames.
+    compact_nickname = re.sub(r"\s+", "", nick_name)
+    candidate_sql = (
+        "SELECT UserName AS wxid, NickName, hex(NickName) AS nickname_hex, length(NickName) AS nickname_len "
+        "FROM Contact "
+        "WHERE Type=2 "
+        f"AND replace(NickName, ' ', '') LIKE '%{quote_sql(compact_nickname)}%' "
+        "LIMIT 10"
+    )
+    LOGGER.debug("Chatroom lookup diagnostic SQL [candidate_scan]: %s", candidate_sql)
+    candidate_result = http_exec_sql(
+        api_url=api_url,
+        db_name="MicroMsg.db",
+        sql=candidate_sql,
+        timeout=timeout,
+    )
+
+    LOGGER.warning(
+        (
+            "Chatroom lookup failed after strategies. nick_name=%r "
+            "hex_exact_response=%r literal_exact_response=%r probe_response=%r candidate_response=%r"
+        ),
+        nick_name,
+        result,
+        literal_result,
+        probe_result,
+        candidate_result,
+    )
     if not wxid:
-        raise RuntimeError(f"No wxid found for nick_name='{nick_name}'. API result: {result}")
-    LOGGER.info("Chatroom wxid lookup succeeded via execSql: nick_name=%s wxid=%s", nick_name, wxid)
+        raise RuntimeError(
+            (
+                "No wxid found for nick_name=%r. "
+                "hex_exact=%r literal_exact=%r probe=%r candidate=%r"
+            )
+            % (nick_name, result, literal_result, probe_result, candidate_result)
+        )
     return wxid
 
 
