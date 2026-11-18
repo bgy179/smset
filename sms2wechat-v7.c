@@ -1071,6 +1071,20 @@ static int json_string_value(const char *json, const char *key,
 }
 
 static int lookup_chatroom_wxid(const char *nickname, char *wxid, size_t wxid_size) {
+    char literal_nickname[SMS_ROUTE_NICKNAME_MAX * 2 + 1];
+    size_t literal_length = 0;
+    for (const unsigned char *source = (const unsigned char *)nickname;
+         *source != '\0' && literal_length + 2 < sizeof(literal_nickname);
+         source++) {
+        if (*source == '\'' || *source == '\\') {
+            literal_nickname[literal_length++] = *source == '\'' ? '\'' : '\\';
+            literal_nickname[literal_length++] = (char)*source;
+        } else {
+            literal_nickname[literal_length++] = (char)*source;
+        }
+    }
+    literal_nickname[literal_length] = '\0';
+
     char nickname_hex[SMS_ROUTE_NICKNAME_MAX * 2 + 1];
     const unsigned char *bytes = (const unsigned char *)nickname;
     for (size_t i = 0; i < strlen(nickname); i++) {
@@ -1078,34 +1092,90 @@ static int lookup_chatroom_wxid(const char *nickname, char *wxid, size_t wxid_si
     }
     nickname_hex[strlen(nickname) * 2] = '\0';
 
-    char sql[sizeof(nickname_hex) + 256];
-    snprintf(sql, sizeof(sql),
-             "SELECT UserName AS wxid, NickName FROM Contact "
-             "WHERE Type=2 AND hex(NickName)='%s' LIMIT 1",
-             nickname_hex);
+    const char *sql_patterns[] = {
+        "SELECT UserName AS wxid, NickName FROM Contact "
+        "WHERE Type=2 AND hex(NickName)='%s' LIMIT 1",
+        "SELECT UserName AS wxid, NickName FROM Contact "
+        "WHERE Type=2 AND NickName='%s' LIMIT 1"
+    };
+    const char *sql_values[] = {nickname_hex, literal_nickname};
 
-    char escaped_sql[sizeof(sql) * 2 + 1];
-    json_escape_string(sql, escaped_sql, sizeof(escaped_sql));
-    char body[sizeof(escaped_sql) + 128];
-    snprintf(body, sizeof(body),
-             "{\"dbName\":\"MicroMsg.db\",\"sql\":\"%s\"}", escaped_sql);
+    int result = -1;
+    for (size_t strategy = 0; strategy < 2 && result != 0; strategy++) {
+        char sql[sizeof(literal_nickname) + 256];
+        snprintf(sql, sizeof(sql), sql_patterns[strategy], sql_values[strategy]);
 
-    ResponseData response = {0};
-    if (post_json_request(g_cfg.wechat_exec_sql_url, body,
-                          g_cfg.command_http_timeout_sec, &response) != 0) {
-        return -1;
+        char escaped_sql[sizeof(sql) * 2 + 1];
+        json_escape_string(sql, escaped_sql, sizeof(escaped_sql));
+        char body[sizeof(escaped_sql) + 128];
+        snprintf(body, sizeof(body),
+                 "{\"dbName\":\"MicroMsg.db\",\"sql\":\"%s\"}", escaped_sql);
+
+        ResponseData response = {0};
+        if (post_json_request(g_cfg.wechat_exec_sql_url, body,
+                              g_cfg.command_http_timeout_sec, &response) != 0) {
+            continue;
+        }
+
+        char success[32] = {0};
+        result = json_string_value(response.buffer, "msg", success, sizeof(success));
+        if (result != 0 || strcmp(success, "success") != 0 ||
+            json_string_value(response.buffer, "wxid", wxid, wxid_size) != 0) {
+            WriteLog("[命令路由] 查询策略%d未命中: %s",
+                     strategy == 0 ? 1 : 2, response.buffer);
+            result = -1;
+        } else {
+            WriteLog("[命令路由] 微信群查询成功 strategy=%s nickname=%s wxid=%s",
+                     strategy == 0 ? "hex_exact" : "literal_exact",
+                     nickname, wxid);
+        }
+        free(response.buffer);
     }
 
-    char success[32] = {0};
-    int result = json_string_value(response.buffer, "msg", success, sizeof(success));
-    if (result != 0 || strcmp(success, "success") != 0 ||
-        json_string_value(response.buffer, "wxid", wxid, wxid_size) != 0) {
-        WriteLog("[命令路由] 微信群查询返回无法识别的结果: %s", response.buffer);
-        result = -1;
-    } else {
-        WriteLog("[命令路由] 微信群查询成功 nickname=%s wxid=%s", nickname, wxid);
+    if (result != 0) {
+        char compact_raw[SMS_ROUTE_NICKNAME_MAX];
+        size_t compact_length = 0;
+        for (const unsigned char *source = (const unsigned char *)nickname;
+             *source != '\0' && compact_length + 1 < sizeof(compact_raw);
+             source++) {
+            if (!isspace(*source)) {
+                compact_raw[compact_length++] = (char)*source;
+            }
+        }
+        compact_raw[compact_length] = '\0';
+
+        char compact_nickname[sizeof(compact_raw) * 2 + 1];
+        size_t escaped_length = 0;
+        for (const unsigned char *source = (const unsigned char *)compact_raw;
+             *source != '\0' &&
+             escaped_length + 2 < sizeof(compact_nickname);
+             source++) {
+            if (*source == '\'' || *source == '\\') {
+                compact_nickname[escaped_length++] =
+                    *source == '\'' ? '\'' : '\\';
+            }
+            compact_nickname[escaped_length++] = (char)*source;
+        }
+        compact_nickname[escaped_length] = '\0';
+
+        char sql[sizeof(compact_nickname) + 300];
+        snprintf(sql, sizeof(sql),
+                 "SELECT UserName AS wxid, NickName, hex(NickName) AS nickname_hex, "
+                 "length(NickName) AS nickname_len FROM Contact WHERE Type=2 "
+                 "AND replace(NickName, ' ', '') LIKE '%%%s%%' LIMIT 10",
+                 compact_nickname);
+        char escaped_sql[sizeof(sql) * 2 + 1];
+        json_escape_string(sql, escaped_sql, sizeof(escaped_sql));
+        char body[sizeof(escaped_sql) + 128];
+        snprintf(body, sizeof(body),
+                 "{\"dbName\":\"MicroMsg.db\",\"sql\":\"%s\"}", escaped_sql);
+        ResponseData diagnostics = {0};
+        if (post_json_request(g_cfg.wechat_exec_sql_url, body,
+                              g_cfg.command_http_timeout_sec, &diagnostics) == 0) {
+            WriteLog("[命令路由] 空白忽略候选诊断: %s", diagnostics.buffer);
+            free(diagnostics.buffer);
+        }
     }
-    free(response.buffer);
     return result;
 }
 
@@ -1490,8 +1560,8 @@ void* SmsCommandWorkerThreadProc(void* lpParam) {
         snprintf(query, sizeof(query),
                  "SELECT id,sender,message_content FROM zbxalerts.decoded_sms "
                  "WHERE send_status=0 AND sender IN (%s) "
-                 "AND (LOCATE('_smsRoute', LTRIM(message_content))=1 "
-                 "OR LOCATE('_smsRegister', LTRIM(message_content))=1) "
+                 "AND (LOCATE('_smsroute', LOWER(LTRIM(message_content)))=1 "
+                 "OR LOCATE('_smsregister', LOWER(LTRIM(message_content)))=1) "
                  "ORDER BY id ASC LIMIT %d",
                  sender_filter, g_cfg.command_batch_size);
 
@@ -1551,8 +1621,8 @@ void* WeChatAsyncPushThreadProc(void* lpParam) {
         const char *sql =
             "SELECT id, target_wxid, message_content FROM decoded_sms "
             "WHERE send_status=0 AND sender='106589665811' "
-            "AND LOCATE('_smsRoute', LTRIM(message_content))<>1 "
-            "AND LOCATE('_smsRegister', LTRIM(message_content))<>1 "
+            "AND LOCATE('_smsroute', LOWER(LTRIM(message_content)))<>1 "
+            "AND LOCATE('_smsregister', LOWER(LTRIM(message_content)))<>1 "
             "ORDER BY id ASC LIMIT 50;";
         if (db_query_with_reconnect(&async_mysql, sql, "后台线程") == 0) {
             MYSQL_RES *res = mysql_store_result(async_mysql);
