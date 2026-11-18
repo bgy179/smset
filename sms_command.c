@@ -103,7 +103,7 @@ int insert_chatroom(void *context, const struct sms_wechat_contact *contact,
     char sql[1024] = {0};
     (void)context;
 
-    snprintf(sql, sizeof(sql), "INSERT INTO wzwmonitor.wechat_chatroom(wxid, nickname, tenantname) "
+    snprintf(sql, sizeof(sql), "INSERT INTO zbxalerts.wechat_chatroom(wxid, nickname, tenantname) "
                 "VALUES('%s', '%s', '%s');", contact->wechat_id, contact->nick_name, tenantname);
 
     mysql_query(mysql_conn, sql);

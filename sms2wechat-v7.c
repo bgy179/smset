@@ -791,8 +791,8 @@ static int cache_full_refresh(void) {
         return -1;
     }
     const char *sql = "SELECT t.tenantname, t.tenantip, c.wxid, c.nickname "
-                      "FROM wzwmonitor.paas_cluster_tenantname_ip t "
-                      "JOIN wzwmonitor.wechat_chatroom c ON t.tenantname = c.tenantname";
+                      "FROM zbxalerts.paas_cluster_tenantname_ip t "
+                      "JOIN zbxalerts.wechat_chatroom c ON t.tenantname = c.tenantname";
     if (db_query_with_reconnect(&conn, sql, "路由缓存") != 0) { 
         mysql_close(conn); return -1; 
     }
@@ -828,8 +828,8 @@ static int query_db_by_ip(const char *tenantip, wxid_result_t *result) {
     mysql_real_escape_string(conn, escaped_ip, tenantip, strlen(tenantip));
     snprintf(sql, sizeof(sql),
         "SELECT t.tenantname, t.tenantip, c.wxid, c.nickname "
-        "FROM wzwmonitor.paas_cluster_tenantname_ip t "
-        "JOIN wzwmonitor.wechat_chatroom c ON t.tenantname = c.tenantname "
+        "FROM zbxalerts.paas_cluster_tenantname_ip t "
+        "JOIN zbxalerts.wechat_chatroom c ON t.tenantname = c.tenantname "
         "WHERE t.tenantip = '%s'", escaped_ip);
 
     if (db_query_with_reconnect(&conn, sql, "路由查找") != 0) { mysql_close(conn); return -1; }
@@ -1276,7 +1276,7 @@ static int lookup_single_string_by_param(MYSQL *conn, const char *sql,
 static int lookup_local_chatroom_wxid(MYSQL *conn, const char *nickname,
                                       char *wxid, size_t wxid_size) {
     const char *sql =
-        "SELECT wxid FROM wzwmonitor.wechat_chatroom "
+        "SELECT wxid FROM zbxalerts.wechat_chatroom "
         "WHERE nickname=? LIMIT 1";
     return lookup_single_string_by_param(conn, sql, nickname, wxid, wxid_size);
 }
@@ -1287,7 +1287,7 @@ static int upsert_chatroom(MYSQL *conn, const char *wxid, const char *nickname) 
     char mutable_type[256];
     char old_tenant[128] = {0};
     const char *select_tenant =
-        "SELECT tenantname FROM wzwmonitor.wechat_chatroom "
+        "SELECT tenantname FROM zbxalerts.wechat_chatroom "
         "WHERE wxid=? LIMIT 1";
     int had_old_tenant =
         lookup_single_string_by_param(conn, select_tenant, wxid,
@@ -1303,7 +1303,7 @@ static int upsert_chatroom(MYSQL *conn, const char *wxid, const char *nickname) 
     mysql_string_bind(&params[3], mutable_wxid);
 
     const char *upsert =
-        "INSERT INTO wzwmonitor.wechat_chatroom "
+        "INSERT INTO zbxalerts.wechat_chatroom "
         "(wxid,nickname,chatroom_type,tenantname) VALUES (?,?,?,?) "
         "ON DUPLICATE KEY UPDATE nickname=VALUES(nickname),"
         "chatroom_type=VALUES(chatroom_type),tenantname=VALUES(tenantname),"
@@ -1317,7 +1317,7 @@ static int upsert_chatroom(MYSQL *conn, const char *wxid, const char *nickname) 
         mysql_string_bind(&sync_params[0], new_tenant);
         mysql_string_bind(&sync_params[1], old_tenant);
         const char *sync_sql =
-            "UPDATE wzwmonitor.paas_cluster_tenantname_ip "
+            "UPDATE zbxalerts.paas_cluster_tenantname_ip "
             "SET tenantname=? WHERE tenantname=?";
         if (mysql_execute_prepared(conn, sync_sql, sync_params, 2) != 0) return -1;
         WriteLog("[命令路由] 已同步 tenantname %s -> %s", old_tenant, wxid);
@@ -1328,7 +1328,7 @@ static int upsert_chatroom(MYSQL *conn, const char *wxid, const char *nickname) 
 static int insert_tenant_ips(MYSQL *conn, const char *wxid,
                              const struct sms_route_command *command) {
     const char *sql =
-        "INSERT INTO wzwmonitor.paas_cluster_tenantname_ip "
+        "INSERT INTO zbxalerts.paas_cluster_tenantname_ip "
         "(tenantname,clustername,tenantip) VALUES (?,?,?)";
     for (size_t i = 0; i < command->ip_count; i++) {
         char tenant[128];
