@@ -70,6 +70,8 @@ typedef struct {
     char sender[32];
     uint8_t msg_data[1400]; 
     size_t data_len;
+    size_t text_units;
+    size_t bit_shift;
     uint8_t dcs;            
 } SMSFrame;
 
@@ -77,6 +79,8 @@ typedef struct SMSPartNode {
     uint8_t part_num;
     uint8_t *data;
     size_t data_len;
+    size_t text_units;
+    size_t bit_shift;
     struct SMSPartNode *next;
 } SMSPartNode;
 
@@ -1812,10 +1816,13 @@ bool parse_raw_pdu(const char *raw_hex, SMSFrame *frame) {
             // 重新校准用户纯正文长度
             if (is_7bit) {
                 size_t udh_bits = udh_total_len * 8;
-                size_t shift_bits = (7 - (udh_bits % 7)) % 7;
-                frame->data_len = udl - ((udh_bits + shift_bits) / 7);
+                size_t udh_septets = (udh_bits + 6) / 7;
+                frame->text_units = udl > udh_septets ? udl - udh_septets : 0;
+                frame->bit_shift = (7 - (udh_bits % 7)) % 7;
+                frame->data_len = ud_len - udh_total_len;
             } else {
                 frame->data_len = ud_len - udh_total_len;
+                frame->text_units = frame->data_len;
             }
         } else {
             WriteLog("[PDU剖析] [格式错误] UDH声明区长度异常");
@@ -1823,7 +1830,9 @@ bool parse_raw_pdu(const char *raw_hex, SMSFrame *frame) {
         }
     } else {  
         frame->is_concat = false; 
-        frame->data_len = is_7bit ? udl : ud_len;   
+        frame->data_len = ud_len;
+        frame->text_units = is_7bit ? udl : ud_len;
+        frame->bit_shift = 0;
     }
     
     // 9. 纯正文 Payload 区域截取
@@ -1946,39 +1955,61 @@ void free_pending_sms(PendingSMS *node) {
     free(node);
 }
 
+static char *decode_pending_parts(PendingSMS *node) {
+    if (!node || !node->parts_head) return NULL;
+
+    size_t input_bytes = 0;
+    size_t text_units = 0;
+    for (SMSPartNode *part = node->parts_head; part; part = part->next) {
+        input_bytes += part->data_len;
+        text_units += part->text_units;
+    }
+    size_t output_capacity = input_bytes * 3 + text_units + 2;
+    char *output = (char *)calloc(1, output_capacity);
+    if (!output) return NULL;
+
+    size_t output_length = 0;
+    for (SMSPartNode *part = node->parts_head; part; part = part->next) {
+        size_t part_capacity = part->data_len * 3 + part->text_units + 2;
+        char *decoded = (char *)calloc(1, part_capacity);
+        if (!decoded) {
+            free(output);
+            return NULL;
+        }
+
+        bool success;
+        if ((node->dcs & 0x0C) == 0x00) {
+            success = gsm7bit_to_utf8(part->data, part->text_units, decoded,
+                                      part_capacity, part->bit_shift);
+        } else {
+            success = ucs2be_to_utf8(part->data, part->data_len, decoded,
+                                     part_capacity);
+        }
+        if (!success) {
+            free(decoded);
+            free(output);
+            return NULL;
+        }
+
+        size_t decoded_length = strlen(decoded);
+        if (decoded_length > output_capacity - output_length - 1) {
+            free(decoded);
+            free(output);
+            return NULL;
+        }
+        memcpy(output + output_length, decoded, decoded_length);
+        output_length += decoded_length;
+        output[output_length] = '\0';
+        free(decoded);
+    }
+    return output;
+}
+
 static void flush_incomplete_pending_sms(PendingSMS *node) {
     if (!node || node->arrived_count == 0 || !node->parts_head) return;
 
-    size_t total = 0;
-    for (SMSPartNode *p = node->parts_head; p; p = p->next) {
-        total += p->data_len;
-    }
-
-    if (total == 0) return;
-
-    uint8_t *full = (uint8_t *)malloc(total);
-    if (!full) return;
-
-    size_t off = 0;
-    for (SMSPartNode *p = node->parts_head; p; p = p->next) {
-        memcpy(full + off, p->data, p->data_len);
-        off += p->data_len;
-    }
-
-    char *utf8 = (char *)malloc(total * 3 + 64);
-    if (!utf8) {
-        free(full);
-        return;
-    }
-
-    bool success = false;
-    if ((node->dcs & 0x0C) == 0x00) {
-        success = gsm7bit_to_utf8(full, total, utf8, total * 3 + 1, 0);
-    } else {
-        success = ucs2be_to_utf8(full, total, utf8, total * 3 + 1);
-    }
-
-    if (success) {
+    char *utf8 = decode_pending_parts(node);
+    if (utf8) {
         char *final_msg = (char *)malloc(strlen(utf8) + 96);
         if (final_msg) {
             snprintf(final_msg, strlen(utf8) + 96,
@@ -1987,14 +2018,12 @@ static void flush_incomplete_pending_sms(PendingSMS *node) {
             dispatch_decoded_sms(node->sender, node->ref_num, node->is_16bit_ref, final_msg, -2);
             free(final_msg);
         }
+        free(utf8);
     }
-
-    free(full);
-    free(utf8);
 }
 
 void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
-    WriteLog("[帧跟踪] raw_id=%d sender=%s concat=%d ref=%d part=%d/%d dcs=0x%02X payload=%zu",
+    WriteLog("[帧跟踪] raw_id=%d sender=%s concat=%d ref=%d part=%d/%d dcs=0x%02X payload=%zu units=%zu shift=%zu",
              raw_table_id,
              frame->sender,
              frame->is_concat ? 1 : 0,
@@ -2002,7 +2031,9 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
              frame->part_num,
              frame->total_parts,
              frame->dcs,
-             frame->data_len);
+             frame->data_len,
+             frame->text_units,
+             frame->bit_shift);
 
     if (!frame->is_concat) {
         char utf8_buf[4096];
@@ -2010,7 +2041,8 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
         
         bool success = false;
         if ((frame->dcs & 0x0C) == 0x00) {
-            success = gsm7bit_to_utf8(frame->msg_data, frame->data_len, utf8_buf, sizeof(utf8_buf), 0);
+            success = gsm7bit_to_utf8(frame->msg_data, frame->text_units,
+                                      utf8_buf, sizeof(utf8_buf), frame->bit_shift);
         } else {
             success = ucs2be_to_utf8(frame->msg_data, frame->data_len, utf8_buf, sizeof(utf8_buf));
         }
@@ -2061,10 +2093,17 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
         }
     }
     
-    SMSPartNode *np = malloc(sizeof(SMSPartNode)); 
+    SMSPartNode *np = malloc(sizeof(SMSPartNode));
+    if (!np) return;
     np->part_num = frame->part_num; 
     np->data_len = frame->data_len;
-    np->data = malloc(frame->data_len); 
+    np->text_units = frame->text_units;
+    np->bit_shift = frame->bit_shift;
+    np->data = malloc(frame->data_len);
+    if (!np->data) {
+        free(np);
+        return;
+    }
     memcpy(np->data, frame->msg_data, frame->data_len); 
     np->next = NULL;
 
@@ -2110,28 +2149,11 @@ void handle_sms_frame(int raw_table_id, SMSFrame *frame) {
 
     if(target->arrived_count == target->total_parts) {
         WriteLog("[长短信合并] 欢呼吧！所有关联分片已全数集结完毕，启动数据流拼装组装...");
-        size_t total = 0; 
-        for(SMSPartNode *p = target->parts_head; p; p = p->next) total += p->data_len;
-        uint8_t *full = malloc(total); 
-        size_t off = 0; 
-        for(SMSPartNode *p = target->parts_head; p; p = p->next) { 
-            memcpy(full + off, p->data, p->data_len); 
-            off += p->data_len; 
-        }
-        char *utf8 = malloc(total * 3 + 1);
-        
-        bool success = false;
-        if ((frame->dcs & 0x0C) == 0x00) {
-            // 长短信合并时的 7bit 解码需要计算 UDH 留下的 shift 位移，代码框架默认以 ucs2 传输较广，此处保留一致性逻辑
-            success = gsm7bit_to_utf8(full, total, utf8, total * 3 + 1, 0);
-        } else {
-            success = ucs2be_to_utf8(full, total, utf8, total * 3 + 1);
-        }
-
-        if(success) {
+        char *utf8 = decode_pending_parts(target);
+        if (utf8) {
             dispatch_decoded_sms(target->sender, target->ref_num, target->is_16bit_ref, utf8, 0);
+            free(utf8);
         }
-        free(full); free(utf8); 
         free_pending_sms(target);
     }
 }
